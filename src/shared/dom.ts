@@ -121,13 +121,15 @@ function getTextSnippet(element: HTMLElement, maxChars = 120): string {
 
   const tagName = element.tagName.toLowerCase();
   if (tagName === "input") {
+    const input = element as HTMLInputElement;
     const type = cleanText(element.getAttribute("type") ?? "").toLowerCase();
-    const value = type === "password" ? "" : cleanText((element as HTMLInputElement).value);
+    const value = type === "password" ? "" : cleanText(input.value);
     return truncate(value, maxChars);
   }
 
   if (tagName === "textarea") {
-    return truncate(cleanText(element.value), maxChars);
+    const textarea = element as HTMLTextAreaElement;
+    return truncate(cleanText(textarea.value), maxChars);
   }
 
   return "";
@@ -197,7 +199,7 @@ function resolveLabel(element: Element): string {
   }
 
   if (tagName === "input" && cleanText(element.getAttribute("type") ?? "").toLowerCase() !== "password") {
-    const value = cleanText(element.value);
+    const value = cleanText((element as HTMLInputElement).value);
     if (value) {
       return value;
     }

@@ -111,12 +111,14 @@
     }
     const tagName = element.tagName.toLowerCase();
     if (tagName === "input") {
+      const input = element;
       const type = cleanText(element.getAttribute("type") ?? "").toLowerCase();
-      const value = type === "password" ? "" : cleanText(element.value);
+      const value = type === "password" ? "" : cleanText(input.value);
       return truncate(value, maxChars);
     }
     if (tagName === "textarea") {
-      return truncate(cleanText(element.value), maxChars);
+      const textarea = element;
+      return truncate(cleanText(textarea.value), maxChars);
     }
     return "";
   }
