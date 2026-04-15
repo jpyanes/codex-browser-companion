@@ -98,6 +98,10 @@ Important output files:
 - `dist/sidepanel/index.html`
 - `dist/sidepanel/panel.js`
 - `dist/sidepanel/panel.css`
+- `dist/icons/icon-16.png`
+- `dist/icons/icon-32.png`
+- `dist/icons/icon-48.png`
+- `dist/icons/icon-128.png`
 
 ## Permissions
 

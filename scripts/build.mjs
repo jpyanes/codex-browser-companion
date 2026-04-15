@@ -1,5 +1,5 @@
 import { build, context } from "esbuild";
-import { mkdir, readFile, rm, writeFile, copyFile } from "node:fs/promises";
+import { cp, mkdir, readFile, rm, writeFile, copyFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -31,6 +31,10 @@ async function writeManifest() {
 async function copyHtmlTemplates() {
   await copyTextFile(entryPath("ui", "popup", "index.html"), distPath("popup", "index.html"));
   await copyTextFile(entryPath("ui", "sidepanel", "index.html"), distPath("sidepanel", "index.html"));
+}
+
+async function copyIconAssets() {
+  await cp(entryPath("assets", "icons"), distPath("icons"), { recursive: true, force: true });
 }
 
 function sharedEsbuildOptions(overrides = {}) {
@@ -106,7 +110,7 @@ export async function buildProject({ watch = false } = {}) {
   if (!watch) {
     await rm(distDir, { recursive: true, force: true });
     await ensureDir(distDir);
-    await Promise.all([writeManifest(), copyHtmlTemplates()]);
+    await Promise.all([writeManifest(), copyHtmlTemplates(), copyIconAssets()]);
     await Promise.all([
       buildBackground(),
       buildContent(),
@@ -117,7 +121,7 @@ export async function buildProject({ watch = false } = {}) {
   }
 
   await ensureDir(distDir);
-  await Promise.all([writeManifest(), copyHtmlTemplates()]);
+  await Promise.all([writeManifest(), copyHtmlTemplates(), copyIconAssets()]);
 
   const contexts = await Promise.all([
     buildBackground({ watch: true }),

@@ -69,6 +69,8 @@ input {
 .hero {
   display: flex;
   justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
   gap: var(--space-4);
   padding: var(--space-5);
   border: 1px solid var(--border);
@@ -82,6 +84,24 @@ input {
 }
 .hero__copy {
   min-width: 0;
+  display: grid;
+  gap: var(--space-2);
+}
+.hero__brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  min-width: 0;
+  flex: 1 1 360px;
+}
+.hero__logo {
+  width: 64px;
+  height: 64px;
+  border-radius: 18px;
+  border: 1px solid rgba(148, 163, 184, 0.26);
+  background: rgba(255, 255, 255, 0.03);
+  box-shadow: 0 16px 32px rgba(0, 0, 0, 0.34);
+  flex: 0 0 auto;
 }
 .eyebrow {
   margin: 0 0 var(--space-2);

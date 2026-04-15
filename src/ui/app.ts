@@ -474,13 +474,17 @@ export class BrowserCompanionApp {
   }
 
   private renderShell(): void {
+    const logoUrl = chrome.runtime.getURL("icons/icon-128.png");
     this.root.innerHTML = `
       <div class="app-shell__frame">
         <header class="hero">
-          <div class="hero__copy">
-            <p class="eyebrow">Codex Browser Companion</p>
-            <h1>Active tab control</h1>
-            <p class="lede">Inspect the current page, queue approved actions, and keep Codex tied to the active tab.</p>
+          <div class="hero__brand">
+            <img class="hero__logo" src="${escapeHtml(logoUrl)}" alt="Codex logo" />
+            <div class="hero__copy">
+              <p class="eyebrow">Codex Browser Companion</p>
+              <h1>Active tab control</h1>
+              <p class="lede">Inspect the current page, queue approved actions, and keep Codex tied to the active tab.</p>
+            </div>
           </div>
           <div class="hero__status">
             <div id="status-chip" class="status-chip status-chip--idle">Idle</div>

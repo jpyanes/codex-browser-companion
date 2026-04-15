@@ -5,12 +5,23 @@
   "description": "A Codex companion Chrome extension for inspecting the active tab, surfacing structured page context, and approving safe browser actions.",
   "minimum_chrome_version": "114",
   "permissions": ["activeTab", "scripting", "storage", "tabs", "sidePanel"],
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
   "background": {
     "service_worker": "background.js",
     "type": "module"
   },
   "action": {
     "default_title": "Codex Browser Companion",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png"
+    },
     "default_popup": "popup/index.html"
   },
   "side_panel": {

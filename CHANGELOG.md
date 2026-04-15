@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+- Added Codex logo assets and wired them into the extension icon, popup header, and side panel.
+
 ## [0.1.0] - 2026-04-15
 
 Initial public release of Codex Browser Companion.
