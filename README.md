@@ -173,6 +173,14 @@ Use these page types after loading the unpacked extension:
 - site-specific adapters
 - safer action sandboxing
 
+## Changelog
+
+See [CHANGELOG.md](./CHANGELOG.md) for release notes.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](./LICENSE).
+
 ## Project Structure
 
 See the source tree in the workspace for the full implementation. The main source folders are `src/background`, `src/content`, `src/shared`, `src/ui`, and `tests`.

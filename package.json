@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "description": "A Chrome extension that lets Codex inspect and operate on the active tab with explicit user approval.",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "build": "node scripts/build.mjs",
