@@ -5,12 +5,22 @@ export type ScanMode = "full" | "interactive" | "summary" | "suggestions";
 export type LogLevel = "debug" | "info" | "success" | "warning" | "error";
 export type ApprovalStatus = "pending" | "approved" | "rejected" | "executing" | "succeeded" | "failed";
 export type DangerLevel = "low" | "medium" | "high";
+export type SemanticConnectionState = "disconnected" | "disabled" | "ready" | "error";
+export type WorkflowStatus = "active" | "paused" | "completed" | "abandoned" | "failed";
+export type WorkflowStepStatus = "pending" | "queued" | "completed" | "blocked" | "failed";
+export type WorkflowStepSource = "command" | "planner" | "memory";
+export type SiteAdapterKind = "social-feed" | "document-editor" | "workspace-login" | "workspace-app" | "general";
 
 export interface BoxRect {
   x: number;
   y: number;
   width: number;
   height: number;
+}
+
+export interface WorkflowRequestContext {
+  workflowId?: string;
+  workflowStepId?: string;
 }
 
 export interface PageStateBasic {
@@ -23,7 +33,31 @@ export interface PageStateBasic {
   formCount: number;
   visibleTextLength: number;
   hasSensitiveInputs: boolean;
+  siteAdapterId: string | null;
+  siteAdapterLabel: string | null;
   updatedAt: string;
+}
+
+export type BridgeConnectionState = "disconnected" | "connecting" | "connected" | "error";
+
+export interface BridgeProfileSummary {
+  email: string;
+  id: string;
+}
+
+export interface BridgeExtensionSummary {
+  extensionId: string;
+  stableKey: string | undefined;
+  browser: string | null;
+  profile: BridgeProfileSummary | null;
+  activeTargets: number;
+  playwriterVersion: string | null;
+}
+
+export interface BridgeSnapshot {
+  relayVersion: string | null;
+  extensions: BridgeExtensionSummary[];
+  checkedAt: string;
 }
 
 export interface PageMeta {
@@ -110,6 +144,15 @@ export interface SemanticNode {
   children: SemanticNode[] | undefined;
 }
 
+export interface SiteAdapterSummary {
+  id: string;
+  label: string;
+  kind: SiteAdapterKind;
+  summary: string;
+  capabilities: string[];
+  notes: string[];
+}
+
 export type ActionKind =
   | "click"
   | "type"
@@ -124,6 +167,9 @@ export interface ActionRequestBase {
   actionId: string;
   tabId: number;
   kind: ActionKind;
+  selector?: string;
+  workflowId?: string;
+  workflowStepId?: string;
 }
 
 export interface ClickActionRequest extends ActionRequestBase {
@@ -201,18 +247,26 @@ export interface ActionResult {
 export interface SuggestedRequestScanPage {
   kind: "scan-page";
   mode: ScanMode;
+  workflowId?: string;
+  workflowStepId?: string;
 }
 
 export interface SuggestedRequestListInteractive {
   kind: "list-interactive-elements";
+  workflowId?: string;
+  workflowStepId?: string;
 }
 
 export interface SuggestedRequestSummarize {
   kind: "summarize-page";
+  workflowId?: string;
+  workflowStepId?: string;
 }
 
 export interface SuggestedRequestSuggestNext {
   kind: "suggest-next-actions";
+  workflowId?: string;
+  workflowStepId?: string;
 }
 
 export interface SuggestedRequestAction {
@@ -235,6 +289,9 @@ export interface SuggestedAction {
   request: SuggestedRequest;
   approvalRequired: boolean;
   dangerLevel: DangerLevel;
+  source: "dom" | "stagehand" | "workflow" | "site";
+  selector: string | undefined;
+  confidence: number | undefined;
 }
 
 export interface PageSnapshot {
@@ -255,6 +312,7 @@ export interface PageSnapshot {
   forms: FormSummary[];
   interactiveElements: InteractiveElementSummary[];
   semanticOutline: SemanticNode[];
+  siteAdapter: SiteAdapterSummary | null;
   suggestedActions: SuggestedAction[];
   summary: string;
 }
@@ -275,6 +333,115 @@ export interface AppError {
   recoverable: boolean;
   tabId: number | undefined;
   occurredAt: string;
+}
+
+export interface SemanticHealthSnapshot {
+  endpoint: string;
+  browserEndpoint: string;
+  status: SemanticConnectionState;
+  model: string | null;
+  reason: string | null;
+  observedAt: string | null;
+  lastError: AppError | null;
+}
+
+export interface SemanticObservationAction {
+  selector: string;
+  description: string;
+  method: string | undefined;
+  arguments: string[] | undefined;
+}
+
+export interface SemanticObservationSnapshot {
+  endpoint: string;
+  browserEndpoint: string;
+  status: SemanticConnectionState;
+  model: string | null;
+  pageUrl: string | null;
+  pageTitle: string | null;
+  reason: string | null;
+  observedAt: string;
+  actions: SemanticObservationAction[];
+}
+
+export interface BridgeState {
+  endpoint: string;
+  status: BridgeConnectionState;
+  relayVersion: string | null;
+  extensions: BridgeExtensionSummary[];
+  activeExtension: BridgeExtensionSummary | null;
+  activeTargetCount: number;
+  checkedAt: string | null;
+  lastError: AppError | null;
+}
+
+export interface SemanticState {
+  endpoint: string;
+  browserEndpoint: string;
+  status: SemanticConnectionState;
+  model: string | null;
+  observedAt: string | null;
+  pageUrl: string | null;
+  pageTitle: string | null;
+  suggestionCount: number;
+  disabledReason: string | null;
+  lastError: AppError | null;
+}
+
+export interface WorkflowPlanStep {
+  stepId: string;
+  title: string;
+  description: string;
+  source: WorkflowStepSource;
+  request: SuggestedRequest | null;
+  approvalRequired: boolean;
+  dangerLevel: DangerLevel;
+  confidence: number;
+  status: WorkflowStepStatus;
+  createdAt: string;
+  updatedAt: string;
+  completedAt: string | null;
+  resultSummary: string | null;
+  notes: string | null;
+}
+
+export interface WorkflowPlan {
+  workflowId: string;
+  objective: string;
+  createdAt: string;
+  updatedAt: string;
+  status: WorkflowStatus;
+  originTabId: number;
+  originUrl: string;
+  originTitle: string;
+  currentStepIndex: number;
+  lastPageUrl: string | null;
+  lastPageTitle: string | null;
+  lastSummary: string | null;
+  steps: WorkflowPlanStep[];
+}
+
+export interface WorkflowHistoryEntry {
+  workflowId: string;
+  objective: string;
+  status: WorkflowStatus;
+  startedAt: string;
+  endedAt: string | null;
+  stepCount: number;
+  completedStepCount: number;
+  originTabId: number;
+  originUrl: string;
+  originTitle: string;
+  lastResult: string | null;
+}
+
+export interface WorkflowState {
+  activeWorkflow: WorkflowPlan | null;
+  recentWorkflows: WorkflowHistoryEntry[];
+  memoryNotes: string[];
+  lastInstruction: string | null;
+  lastObjective: string | null;
+  lastUpdatedAt: string;
 }
 
 export interface ApprovalRequest {
@@ -313,6 +480,9 @@ export interface TrackedTabState {
 export interface ExtensionState {
   activeTabId: number | null;
   tabs: Record<number, TrackedTabState>;
+  bridge: BridgeState;
+  semantic: SemanticState;
+  workflow: WorkflowState;
   status: AssistantConnectionState;
   lastUpdatedAt: string;
 }

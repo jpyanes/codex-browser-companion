@@ -1,10 +1,98 @@
 // src/shared/constants.ts
 var STORAGE_KEY_STATE = "codex-browser-companion.state";
+var DEFAULT_BRIDGE_ENDPOINT = "http://localhost:19988";
+var BRIDGE_REQUEST_TIMEOUT_MS = 1500;
+var BRIDGE_POLL_INTERVAL_MS = 2500;
+var DEFAULT_SEMANTIC_ENDPOINT = "http://localhost:19989";
+var SEMANTIC_STATUS_REQUEST_TIMEOUT_MS = 1500;
+var SEMANTIC_OBSERVE_REQUEST_TIMEOUT_MS = 3e4;
+var SEMANTIC_POLL_INTERVAL_MS = 4e3;
 var MAX_ACTIVITY_LOG_ENTRIES = 40;
 var MAX_APPROVAL_QUEUE_ENTRIES = 20;
+var MAX_WORKFLOW_HISTORY_ENTRIES = 6;
+var MAX_WORKFLOW_NOTES = 10;
+var MAX_WORKFLOW_STEPS = 8;
 var CONTENT_SCRIPT_READY_RETRIES = 3;
 var CONTENT_SCRIPT_RETRY_DELAY_MS = 75;
 var DEFAULT_SCROLL_AMOUNT = 600;
+
+// src/shared/bridge.ts
+function isRecord(value) {
+  return typeof value === "object" && value !== null;
+}
+function toStringOrNull(value) {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+function toNumberOrDefault(value, fallback) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return fallback;
+}
+function normalizeProfile(value) {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const email = toStringOrNull(value.email);
+  const id = toStringOrNull(value.id);
+  if (!email || !id) {
+    return null;
+  }
+  return { email, id };
+}
+function normalizeBridgeExtensionSummary(value, fallbackExtensionId = "default") {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const extensionId = toStringOrNull(value.extensionId) ?? fallbackExtensionId;
+  const browser = toStringOrNull(value.browser);
+  const profile = normalizeProfile(value.profile);
+  const activeTargets = toNumberOrDefault(value.activeTargets, 0);
+  const playwriterVersion = toStringOrNull(value.playwriterVersion);
+  return {
+    extensionId,
+    stableKey: toStringOrNull(value.stableKey) ?? void 0,
+    browser,
+    profile,
+    activeTargets,
+    playwriterVersion
+  };
+}
+function createDisconnectedBridgeState(endpoint = DEFAULT_BRIDGE_ENDPOINT, error = null, checkedAt = null) {
+  return {
+    endpoint,
+    status: error ? "error" : "disconnected",
+    relayVersion: null,
+    extensions: [],
+    activeExtension: null,
+    activeTargetCount: 0,
+    checkedAt,
+    lastError: error
+  };
+}
+function buildBridgeState(snapshot, options = {}) {
+  const endpoint = options.endpoint ?? DEFAULT_BRIDGE_ENDPOINT;
+  const extensions = snapshot.extensions.slice();
+  const activeExtension = extensions.find((extension) => extension.activeTargets > 0) ?? extensions[0] ?? null;
+  const activeTargetCount = extensions.reduce((count, extension) => count + extension.activeTargets, 0);
+  const status = options.lastError ? "error" : extensions.length > 0 ? "connected" : snapshot.relayVersion ? "connecting" : "disconnected";
+  return {
+    endpoint,
+    status,
+    relayVersion: snapshot.relayVersion,
+    extensions,
+    activeExtension,
+    activeTargetCount,
+    checkedAt: snapshot.checkedAt,
+    lastError: options.lastError ?? null
+  };
+}
 
 // src/shared/logger.ts
 function nowIso() {
@@ -164,6 +252,794 @@ function isBlockedSensitiveAction(action, snapshot) {
   return false;
 }
 
+// src/background/bridge-client.ts
+async function fetchJson(url, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(`Request to ${url} failed with HTTP ${response.status}.`);
+    }
+    return await response.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+async function probeExtensions(endpoint) {
+  const [versionResponse, extensionsResponse, fallbackResponse] = await Promise.all([
+    fetchJson(`${endpoint}/version`, BRIDGE_REQUEST_TIMEOUT_MS).catch(() => null),
+    fetchJson(`${endpoint}/extensions/status`, BRIDGE_REQUEST_TIMEOUT_MS).catch(() => null),
+    fetchJson(`${endpoint}/extension/status`, BRIDGE_REQUEST_TIMEOUT_MS).catch(() => null)
+  ]);
+  const relayVersion = typeof versionResponse?.version === "string" ? versionResponse.version : null;
+  const extensions = Array.isArray(extensionsResponse?.extensions) ? extensionsResponse.extensions.map((entry, index) => normalizeBridgeExtensionSummary(entry, `extension-${index + 1}`)).filter((entry) => entry !== null) : [];
+  if (extensions.length === 0 && fallbackResponse && typeof fallbackResponse.connected === "boolean" && fallbackResponse.connected) {
+    const fallbackExtension = normalizeBridgeExtensionSummary(
+      {
+        extensionId: "default",
+        browser: fallbackResponse.browser,
+        profile: fallbackResponse.profile,
+        activeTargets: fallbackResponse.activeTargets,
+        playwriterVersion: fallbackResponse.playwriterVersion
+      },
+      "default"
+    );
+    if (fallbackExtension) {
+      extensions.push(fallbackExtension);
+    }
+  }
+  return {
+    relayVersion,
+    extensions,
+    checkedAt: nowIso()
+  };
+}
+async function refreshBridgeState(endpoint = DEFAULT_BRIDGE_ENDPOINT) {
+  try {
+    const snapshot = await probeExtensions(endpoint);
+    return buildBridgeState(snapshot, { endpoint });
+  } catch (error) {
+    return createDisconnectedBridgeState(
+      endpoint,
+      normalizeError(error, "BRIDGE_UNAVAILABLE", { recoverable: true }),
+      nowIso()
+    );
+  }
+}
+
+// src/shared/semantic.ts
+function isRecord2(value) {
+  return typeof value === "object" && value !== null;
+}
+function toStringOrNull2(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+function createDisabledSemanticState(endpoint = DEFAULT_SEMANTIC_ENDPOINT, disabledReason = null) {
+  return {
+    endpoint,
+    browserEndpoint: "",
+    status: disabledReason ? "disabled" : "disconnected",
+    model: null,
+    observedAt: null,
+    pageUrl: null,
+    pageTitle: null,
+    suggestionCount: 0,
+    disabledReason,
+    lastError: null
+  };
+}
+function buildSemanticState(snapshot) {
+  return {
+    endpoint: snapshot.endpoint,
+    browserEndpoint: snapshot.browserEndpoint,
+    status: snapshot.status,
+    model: snapshot.model,
+    observedAt: snapshot.observedAt,
+    pageUrl: null,
+    pageTitle: null,
+    suggestionCount: 0,
+    disabledReason: snapshot.status === "disabled" ? snapshot.reason : null,
+    lastError: snapshot.lastError
+  };
+}
+function updateSemanticStateWithObservation(state2, observation) {
+  return {
+    ...state2,
+    endpoint: observation.endpoint,
+    browserEndpoint: observation.browserEndpoint,
+    status: observation.status,
+    model: observation.model,
+    observedAt: observation.observedAt,
+    pageUrl: observation.pageUrl,
+    pageTitle: observation.pageTitle,
+    suggestionCount: observation.actions.length,
+    disabledReason: observation.status === "disabled" ? observation.reason : state2.disabledReason,
+    lastError: observation.status === "error" ? normalizeError(observation.reason || "Stagehand reported an error.", "SEMANTIC_BRIDGE_ERROR", { recoverable: true }) : state2.lastError
+  };
+}
+function semanticInstructionFromSnapshot(snapshot) {
+  const pageSummary = snapshot.summary || "No structured summary is available.";
+  const title = snapshot.title || "Untitled page";
+  const pageKind = snapshot.pageKind === "unknown" ? "page" : `${snapshot.pageKind} page`;
+  return [
+    "Identify up to 5 high-value click actions on the current page for a browser assistant.",
+    "Focus on visible buttons, links, or other obvious controls that help the user continue the task.",
+    "Do not suggest typing into password or file fields.",
+    "Do not suggest destructive or irreversible actions.",
+    `Page title: ${title}.`,
+    `Page kind: ${pageKind}.`,
+    `Page summary: ${pageSummary}.`
+  ].join(" ");
+}
+function normalizeMethod(method) {
+  return method?.trim().toLowerCase() ?? "";
+}
+function isClickLikeAction(action) {
+  const method = normalizeMethod(action.method);
+  return method === "click" || method === "press" || method === "tap" || method === "open";
+}
+async function buildSemanticSuggestions(observation, snapshot, resolveTarget) {
+  const suggestions = [];
+  for (const [index, action] of observation.actions.entries()) {
+    if (!isClickLikeAction(action)) {
+      continue;
+    }
+    const selector = toStringOrNull2(action.selector);
+    if (!selector) {
+      continue;
+    }
+    const resolved = await resolveTarget(selector);
+    if (!resolved) {
+      continue;
+    }
+    const actionRequest = {
+      actionId: globalThis.crypto?.randomUUID?.() ?? `action_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+      tabId: snapshot.tabId,
+      kind: "click",
+      elementId: resolved.elementId,
+      label: resolved.label || action.description || selector,
+      selector
+    };
+    suggestions.push({
+      id: `stagehand-${snapshot.snapshotId}-${index}`,
+      title: action.description || resolved.label || "Semantic click target",
+      description: `Stagehand suggested ${action.description || "a click action"}.`,
+      buttonLabel: "Queue",
+      request: { kind: "request-action", action: actionRequest },
+      approvalRequired: true,
+      dangerLevel: classifyDanger(actionRequest, snapshot),
+      source: "stagehand",
+      selector,
+      confidence: void 0
+    });
+  }
+  return suggestions;
+}
+function normalizeSemanticHealth(value, fallbackEndpoint = DEFAULT_SEMANTIC_ENDPOINT) {
+  if (!isRecord2(value)) {
+    return {
+      endpoint: fallbackEndpoint,
+      browserEndpoint: "",
+      status: "disconnected",
+      model: null,
+      reason: "Invalid semantic bridge response.",
+      observedAt: null,
+      lastError: null
+    };
+  }
+  const status = toStringOrNull2(value.status);
+  const browserEndpoint = toStringOrNull2(value.browserEndpoint) ?? "";
+  const observedAt = toStringOrNull2(value.observedAt);
+  const lastError = isRecord2(value.lastError) ? normalizeError(value.lastError, "SEMANTIC_BRIDGE_ERROR", { recoverable: true }) : null;
+  return {
+    endpoint: toStringOrNull2(value.endpoint) ?? fallbackEndpoint,
+    browserEndpoint,
+    status: status === "ready" || status === "disabled" || status === "error" ? status : "disconnected",
+    model: toStringOrNull2(value.model),
+    reason: toStringOrNull2(value.reason),
+    observedAt,
+    lastError
+  };
+}
+function normalizeSemanticObservation(value, fallbackEndpoint = DEFAULT_SEMANTIC_ENDPOINT) {
+  if (!isRecord2(value)) {
+    return {
+      endpoint: fallbackEndpoint,
+      browserEndpoint: "",
+      status: "disconnected",
+      model: null,
+      pageUrl: null,
+      pageTitle: null,
+      reason: "Invalid semantic observation response.",
+      observedAt: nowIso(),
+      actions: []
+    };
+  }
+  const actions = Array.isArray(value.actions) ? value.actions.filter(isRecord2).map((entry) => ({
+    selector: toStringOrNull2(entry.selector) ?? "",
+    description: toStringOrNull2(entry.description) ?? "",
+    method: toStringOrNull2(entry.method) ?? void 0,
+    arguments: Array.isArray(entry.arguments) ? entry.arguments.map((argument) => toStringOrNull2(argument) ?? String(argument ?? "")).filter(Boolean) : void 0
+  })).filter((entry) => Boolean(entry.selector && entry.description)) : [];
+  const status = toStringOrNull2(value.status);
+  return {
+    endpoint: toStringOrNull2(value.endpoint) ?? fallbackEndpoint,
+    browserEndpoint: toStringOrNull2(value.browserEndpoint) ?? "",
+    status: status === "ready" || status === "disabled" || status === "error" ? status : "disconnected",
+    model: toStringOrNull2(value.model),
+    pageUrl: toStringOrNull2(value.pageUrl),
+    pageTitle: toStringOrNull2(value.pageTitle),
+    reason: toStringOrNull2(value.reason),
+    observedAt: toStringOrNull2(value.observedAt) ?? nowIso(),
+    actions
+  };
+}
+
+// src/shared/workflow.ts
+function makeId(prefix) {
+  return globalThis.crypto?.randomUUID?.() ?? `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+function isRecord3(value) {
+  return typeof value === "object" && value !== null;
+}
+function normalize(input) {
+  return input.trim().replace(/\s+/g, " ");
+}
+function truncate(items, max) {
+  if (items.length <= max) {
+    return items;
+  }
+  return items.slice(items.length - max);
+}
+function normalizeStepStatus(value) {
+  if (value === "pending" || value === "queued" || value === "completed" || value === "blocked" || value === "failed") {
+    return value;
+  }
+  return "pending";
+}
+function normalizeWorkflowStatus(value) {
+  if (value === "active" || value === "paused" || value === "completed" || value === "abandoned" || value === "failed") {
+    return value;
+  }
+  return "active";
+}
+function normalizeDangerLevel(value) {
+  if (value === "low" || value === "medium" || value === "high") {
+    return value;
+  }
+  return "low";
+}
+function normalizeRequest(value) {
+  if (!isRecord3(value) || typeof value.kind !== "string") {
+    return null;
+  }
+  switch (value.kind) {
+    case "scan-page":
+      return {
+        kind: "scan-page",
+        mode: value.mode === "interactive" || value.mode === "summary" || value.mode === "suggestions" ? value.mode : "full",
+        ...typeof value.workflowId === "string" ? { workflowId: value.workflowId } : {},
+        ...typeof value.workflowStepId === "string" ? { workflowStepId: value.workflowStepId } : {}
+      };
+    case "list-interactive-elements":
+      return {
+        kind: "list-interactive-elements",
+        ...typeof value.workflowId === "string" ? { workflowId: value.workflowId } : {},
+        ...typeof value.workflowStepId === "string" ? { workflowStepId: value.workflowStepId } : {}
+      };
+    case "summarize-page":
+      return {
+        kind: "summarize-page",
+        ...typeof value.workflowId === "string" ? { workflowId: value.workflowId } : {},
+        ...typeof value.workflowStepId === "string" ? { workflowStepId: value.workflowStepId } : {}
+      };
+    case "suggest-next-actions":
+      return {
+        kind: "suggest-next-actions",
+        ...typeof value.workflowId === "string" ? { workflowId: value.workflowId } : {},
+        ...typeof value.workflowStepId === "string" ? { workflowStepId: value.workflowStepId } : {}
+      };
+    case "request-action":
+      if (!isRecord3(value.action) || typeof value.action.kind !== "string" || typeof value.action.actionId !== "string" || typeof value.action.tabId !== "number") {
+        return null;
+      }
+      return {
+        kind: "request-action",
+        action: value.action
+      };
+    default:
+      return null;
+  }
+}
+function normalizeStep(value) {
+  if (!isRecord3(value)) {
+    return null;
+  }
+  const request = normalizeRequest(value.request);
+  return {
+    stepId: typeof value.stepId === "string" ? value.stepId : makeId("workflow-step"),
+    title: typeof value.title === "string" && value.title.trim() ? value.title.trim() : "Untitled step",
+    description: typeof value.description === "string" ? value.description : "",
+    source: value.source === "planner" || value.source === "memory" ? value.source : "command",
+    request,
+    approvalRequired: typeof value.approvalRequired === "boolean" ? value.approvalRequired : false,
+    dangerLevel: normalizeDangerLevel(value.dangerLevel),
+    confidence: typeof value.confidence === "number" && Number.isFinite(value.confidence) ? value.confidence : 0.5,
+    status: normalizeStepStatus(value.status),
+    createdAt: typeof value.createdAt === "string" ? value.createdAt : nowIso(),
+    updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : nowIso(),
+    completedAt: typeof value.completedAt === "string" ? value.completedAt : null,
+    resultSummary: typeof value.resultSummary === "string" ? value.resultSummary : null,
+    notes: typeof value.notes === "string" ? value.notes : null
+  };
+}
+function normalizeHistoryEntry(value) {
+  if (!isRecord3(value)) {
+    return null;
+  }
+  return {
+    workflowId: typeof value.workflowId === "string" ? value.workflowId : makeId("workflow"),
+    objective: typeof value.objective === "string" ? value.objective : "Untitled workflow",
+    status: normalizeWorkflowStatus(value.status),
+    startedAt: typeof value.startedAt === "string" ? value.startedAt : nowIso(),
+    endedAt: typeof value.endedAt === "string" ? value.endedAt : null,
+    stepCount: typeof value.stepCount === "number" && Number.isFinite(value.stepCount) ? value.stepCount : 0,
+    completedStepCount: typeof value.completedStepCount === "number" && Number.isFinite(value.completedStepCount) ? value.completedStepCount : 0,
+    originTabId: typeof value.originTabId === "number" ? value.originTabId : -1,
+    originUrl: typeof value.originUrl === "string" ? value.originUrl : "",
+    originTitle: typeof value.originTitle === "string" ? value.originTitle : "",
+    lastResult: typeof value.lastResult === "string" ? value.lastResult : null
+  };
+}
+function normalizeWorkflowPlan(value) {
+  if (!isRecord3(value)) {
+    return null;
+  }
+  const steps = Array.isArray(value.steps) ? value.steps.map(normalizeStep).filter((step) => Boolean(step)).slice(0, MAX_WORKFLOW_STEPS) : [];
+  return {
+    workflowId: typeof value.workflowId === "string" ? value.workflowId : makeId("workflow"),
+    objective: typeof value.objective === "string" ? value.objective : "Untitled workflow",
+    createdAt: typeof value.createdAt === "string" ? value.createdAt : nowIso(),
+    updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : nowIso(),
+    status: normalizeWorkflowStatus(value.status),
+    originTabId: typeof value.originTabId === "number" ? value.originTabId : -1,
+    originUrl: typeof value.originUrl === "string" ? value.originUrl : "",
+    originTitle: typeof value.originTitle === "string" ? value.originTitle : "",
+    currentStepIndex: typeof value.currentStepIndex === "number" && Number.isFinite(value.currentStepIndex) ? value.currentStepIndex : 0,
+    lastPageUrl: typeof value.lastPageUrl === "string" ? value.lastPageUrl : null,
+    lastPageTitle: typeof value.lastPageTitle === "string" ? value.lastPageTitle : null,
+    lastSummary: typeof value.lastSummary === "string" ? value.lastSummary : null,
+    steps
+  };
+}
+function hasWorkflowContext(context) {
+  return Boolean(context?.workflowId && context?.workflowStepId);
+}
+function getWorkflowNextStep(plan) {
+  if (!plan) {
+    return null;
+  }
+  const step = plan.steps[plan.currentStepIndex] ?? null;
+  if (!step) {
+    return null;
+  }
+  if (step.status === "completed" || step.status === "failed") {
+    return null;
+  }
+  return step;
+}
+function isWorkflowPlanPaused(plan) {
+  const step = plan.steps[plan.currentStepIndex] ?? null;
+  return Boolean(step && (step.status === "blocked" || !step.request));
+}
+function isWorkflowPlanComplete(plan) {
+  return plan.currentStepIndex >= plan.steps.length;
+}
+function summarizePlanEntry(plan) {
+  const completedStepCount = plan.steps.filter((step) => step.status === "completed").length;
+  const lastResult = [...plan.steps].reverse().find((step) => step.resultSummary)?.resultSummary ?? null;
+  return {
+    workflowId: plan.workflowId,
+    objective: plan.objective,
+    status: plan.status,
+    startedAt: plan.createdAt,
+    endedAt: plan.status === "active" ? null : plan.updatedAt,
+    stepCount: plan.steps.length,
+    completedStepCount,
+    originTabId: plan.originTabId,
+    originUrl: plan.originUrl,
+    originTitle: plan.originTitle,
+    lastResult
+  };
+}
+function maybeArchiveWorkflow(state2, workflow) {
+  const nextWorkflow = {
+    ...workflow,
+    updatedAt: nowIso()
+  };
+  if (isWorkflowPlanComplete(nextWorkflow)) {
+    return archiveActiveWorkflow(
+      {
+        ...state2,
+        activeWorkflow: nextWorkflow
+      },
+      "completed",
+      { resultSummary: nextWorkflow.lastSummary }
+    );
+  }
+  if (isWorkflowPlanPaused(nextWorkflow)) {
+    return {
+      ...state2,
+      activeWorkflow: {
+        ...nextWorkflow,
+        status: "paused"
+      },
+      lastUpdatedAt: nowIso()
+    };
+  }
+  return {
+    ...state2,
+    activeWorkflow: {
+      ...nextWorkflow,
+      status: "active"
+    },
+    lastUpdatedAt: nowIso()
+  };
+}
+function appendNote(state2, note) {
+  const normalized = normalize(note);
+  if (!normalized) {
+    return state2;
+  }
+  return {
+    ...state2,
+    memoryNotes: truncate([...state2.memoryNotes, normalized], MAX_WORKFLOW_NOTES),
+    lastUpdatedAt: nowIso()
+  };
+}
+function archiveActiveWorkflow(state2, status, options = {}) {
+  if (!state2.activeWorkflow) {
+    return options.note ? appendNote(state2, options.note) : state2;
+  }
+  const nextWorkflow = {
+    ...state2.activeWorkflow,
+    status,
+    updatedAt: nowIso()
+  };
+  const historyEntry = {
+    ...summarizePlanEntry(nextWorkflow),
+    lastResult: options.resultSummary ?? summarizePlanEntry(nextWorkflow).lastResult
+  };
+  const nextState = {
+    ...state2,
+    activeWorkflow: null,
+    recentWorkflows: truncate([...state2.recentWorkflows, historyEntry], MAX_WORKFLOW_HISTORY_ENTRIES),
+    lastUpdatedAt: nowIso()
+  };
+  return options.note ? appendNote(nextState, options.note) : nextState;
+}
+function updateWorkflowStepByContext(state2, context, status, resultSummary) {
+  if (!hasWorkflowContext(context) || !state2.activeWorkflow || context.workflowId !== state2.activeWorkflow.workflowId) {
+    return state2;
+  }
+  const workflow = state2.activeWorkflow;
+  const stepIndex = workflow.steps.findIndex((step2) => step2.stepId === context.workflowStepId);
+  if (stepIndex < 0) {
+    return state2;
+  }
+  const step = workflow.steps[stepIndex];
+  const updatedStep = {
+    ...step,
+    status,
+    updatedAt: nowIso(),
+    completedAt: status === "completed" ? nowIso() : step.completedAt,
+    resultSummary: resultSummary ?? step.resultSummary
+  };
+  let nextWorkflow = {
+    ...workflow,
+    steps: workflow.steps.map((entry, index) => index === stepIndex ? updatedStep : entry),
+    currentStepIndex: Math.max(workflow.currentStepIndex, status === "completed" ? stepIndex + 1 : stepIndex),
+    updatedAt: nowIso(),
+    lastSummary: resultSummary ?? workflow.lastSummary
+  };
+  if (status === "failed") {
+    const archived = archiveActiveWorkflow(
+      {
+        ...state2,
+        activeWorkflow: nextWorkflow
+      },
+      "failed",
+      { resultSummary }
+    );
+    return appendNote(archived, `Workflow step failed: ${step.title}`);
+  }
+  const nextState = {
+    ...state2,
+    activeWorkflow: nextWorkflow,
+    lastUpdatedAt: nowIso()
+  };
+  if (status === "queued") {
+    return appendNote(nextState, `Queued workflow step: ${step.title}`);
+  }
+  if (status === "completed") {
+    nextWorkflow = {
+      ...nextWorkflow,
+      currentStepIndex: stepIndex + 1
+    };
+    const finalizedState = maybeArchiveWorkflow(
+      {
+        ...nextState,
+        activeWorkflow: nextWorkflow
+      },
+      nextWorkflow
+    );
+    if (finalizedState.activeWorkflow) {
+      const cursorStep = finalizedState.activeWorkflow.steps[finalizedState.activeWorkflow.currentStepIndex] ?? null;
+      if (cursorStep && finalizedState.activeWorkflow.status === "paused") {
+        return appendNote(finalizedState, `Workflow "${finalizedState.activeWorkflow.objective}" is paused on "${cursorStep.title}".`);
+      }
+    }
+    return finalizedState;
+  }
+  return maybeArchiveWorkflow(nextState, nextWorkflow);
+}
+function createInitialWorkflowState() {
+  return {
+    activeWorkflow: null,
+    recentWorkflows: [],
+    memoryNotes: [],
+    lastInstruction: null,
+    lastObjective: null,
+    lastUpdatedAt: nowIso()
+  };
+}
+function normalizeWorkflowState(partial) {
+  const fallback = createInitialWorkflowState();
+  if (!partial) {
+    return fallback;
+  }
+  const activeWorkflow = normalizeWorkflowPlan(partial.activeWorkflow);
+  const recentWorkflows = Array.isArray(partial.recentWorkflows) ? partial.recentWorkflows.map(normalizeHistoryEntry).filter((entry) => Boolean(entry)).slice(-MAX_WORKFLOW_HISTORY_ENTRIES) : [];
+  return {
+    activeWorkflow,
+    recentWorkflows,
+    memoryNotes: Array.isArray(partial.memoryNotes) ? partial.memoryNotes.filter((note) => typeof note === "string" && note.trim().length > 0).slice(-MAX_WORKFLOW_NOTES) : [],
+    lastInstruction: typeof partial.lastInstruction === "string" ? partial.lastInstruction : null,
+    lastObjective: typeof partial.lastObjective === "string" ? partial.lastObjective : null,
+    lastUpdatedAt: typeof partial.lastUpdatedAt === "string" ? partial.lastUpdatedAt : nowIso()
+  };
+}
+function requestLabelForStep(step, stepNumber, workflow) {
+  if (step.request?.kind === "request-action") {
+    return `Step ${stepNumber}: ${step.title}`;
+  }
+  if (step.request?.kind === "scan-page") {
+    return `Step ${stepNumber}: ${step.title}`;
+  }
+  return `Step ${stepNumber}: ${step.title}`;
+}
+function buildWorkflowStepSuggestion(workflow, step, index) {
+  if (!step.request || step.status === "blocked") {
+    return null;
+  }
+  return {
+    id: `workflow-${workflow.workflowId}-${step.stepId}`,
+    title: requestLabelForStep(step, index + 1, workflow),
+    description: step.description || `Continue the workflow "${workflow.objective}".`,
+    buttonLabel: step.request.kind === "request-action" ? "Queue step" : "Run step",
+    request: step.request,
+    approvalRequired: step.approvalRequired,
+    dangerLevel: step.dangerLevel,
+    source: "workflow",
+    selector: void 0,
+    confidence: step.confidence
+  };
+}
+function buildWorkflowRescanSuggestion(workflow, snapshot) {
+  const changedPage = workflow.lastPageUrl && workflow.lastPageUrl !== snapshot.url;
+  if (!changedPage) {
+    return null;
+  }
+  return {
+    id: `workflow-rescan-${workflow.workflowId}-${snapshot.snapshotId}`,
+    title: `Rescan before continuing "${workflow.objective}"`,
+    description: `The workflow was last observed on ${workflow.lastPageTitle || workflow.lastPageUrl || "a previous page"} and the active tab has changed.`,
+    buttonLabel: "Rescan",
+    request: {
+      kind: "scan-page",
+      mode: "suggestions",
+      workflowId: workflow.workflowId
+    },
+    approvalRequired: false,
+    dangerLevel: "low",
+    source: "workflow",
+    selector: void 0,
+    confidence: 0.8
+  };
+}
+function buildWorkflowSuggestions(workflowState, snapshot) {
+  const workflow = workflowState.activeWorkflow;
+  if (!workflow) {
+    return [];
+  }
+  const suggestions = [];
+  const rescanSuggestion = buildWorkflowRescanSuggestion(workflow, snapshot);
+  if (rescanSuggestion) {
+    suggestions.push(rescanSuggestion);
+  }
+  const nextStep = getWorkflowNextStep(workflow);
+  if (nextStep) {
+    const stepSuggestion = buildWorkflowStepSuggestion(workflow, nextStep, workflow.currentStepIndex);
+    if (stepSuggestion) {
+      suggestions.push(stepSuggestion);
+    }
+  }
+  return suggestions;
+}
+function recordWorkflowPlan(state2, plan, snapshot) {
+  const nextState = state2.activeWorkflow ? archiveActiveWorkflow(state2, "abandoned", { note: `Replaced active workflow "${state2.activeWorkflow.objective}".` }) : state2;
+  const workflow = {
+    ...plan,
+    createdAt: plan.createdAt || nowIso(),
+    updatedAt: nowIso(),
+    status: "active",
+    originTabId: snapshot?.tabId ?? plan.originTabId,
+    originUrl: snapshot?.url ?? plan.originUrl,
+    originTitle: snapshot?.title ?? plan.originTitle,
+    lastPageUrl: snapshot?.url ?? plan.lastPageUrl,
+    lastPageTitle: snapshot?.title ?? plan.lastPageTitle,
+    lastSummary: snapshot?.summary ?? plan.lastSummary,
+    steps: plan.steps.slice(0, MAX_WORKFLOW_STEPS),
+    currentStepIndex: Math.max(0, Math.min(plan.currentStepIndex, plan.steps.length))
+  };
+  const note = `Planned workflow: ${workflow.objective}`;
+  return {
+    ...nextState,
+    activeWorkflow: workflow,
+    recentWorkflows: nextState.recentWorkflows,
+    memoryNotes: truncate([...nextState.memoryNotes, note], MAX_WORKFLOW_NOTES),
+    lastInstruction: workflow.objective,
+    lastObjective: workflow.objective,
+    lastUpdatedAt: nowIso()
+  };
+}
+function recordWorkflowPageState(state2, tabId, pageState, snapshot) {
+  if (!state2.activeWorkflow) {
+    return state2;
+  }
+  const workflow = state2.activeWorkflow;
+  const nextUrl = snapshot?.url ?? pageState?.url ?? workflow.lastPageUrl;
+  const nextTitle = snapshot?.title ?? pageState?.title ?? workflow.lastPageTitle;
+  const nextSummary = snapshot?.summary ?? workflow.lastSummary;
+  const changed = Boolean(nextUrl && workflow.lastPageUrl && nextUrl !== workflow.lastPageUrl) || Boolean(nextTitle && workflow.lastPageTitle && nextTitle !== workflow.lastPageTitle);
+  const nextWorkflow = {
+    ...workflow,
+    lastPageUrl: nextUrl ?? null,
+    lastPageTitle: nextTitle ?? null,
+    lastSummary: nextSummary ?? null,
+    updatedAt: nowIso()
+  };
+  let nextState = {
+    ...state2,
+    activeWorkflow: nextWorkflow,
+    lastUpdatedAt: nowIso()
+  };
+  if (changed) {
+    nextState = appendNote(
+      nextState,
+      `Workflow "${workflow.objective}" observed tab ${tabId} change to ${nextTitle || nextUrl || "unknown page"}.`
+    );
+  }
+  return nextState;
+}
+function markWorkflowStepQueued(state2, action) {
+  return updateWorkflowStepByContext(state2, action, "queued", null);
+}
+function markWorkflowStepCompleted(state2, action, resultSummary) {
+  return updateWorkflowStepByContext(state2, action, "completed", resultSummary);
+}
+function markWorkflowStepFailed(state2, action, reason) {
+  return updateWorkflowStepByContext(state2, action, "failed", reason);
+}
+function markWorkflowRequestCompleted(state2, context, resultSummary) {
+  return updateWorkflowStepByContext(state2, context, "completed", resultSummary);
+}
+function markWorkflowRequestFailed(state2, context, reason) {
+  return updateWorkflowStepByContext(state2, context, "failed", reason);
+}
+
+// src/shared/tab-orchestration.ts
+function summarizeTrackedTab(tab) {
+  const pieces = [tab.title || "Untitled page"];
+  if (tab.url) {
+    pieces.push(tab.url);
+  }
+  pieces.push(`Window ${tab.windowId}`);
+  if (tab.pageState) {
+    pieces.push(`${tab.pageState.pageKind}`);
+    if (tab.pageState.siteAdapterLabel) {
+      pieces.push(tab.pageState.siteAdapterLabel);
+    }
+    pieces.push(`${tab.pageState.interactiveCount} interactive`);
+  }
+  return pieces.join(" · ");
+}
+
+// src/background/semantic-client.ts
+async function fetchJson2(url, timeoutMs, init) {
+  const controller = new AbortController();
+  const timeout = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      ...init,
+      signal: controller.signal,
+      headers: {
+        "content-type": "application/json",
+        ...init?.headers ?? {}
+      }
+    });
+    if (!response.ok) {
+      throw new Error(`Request to ${url} failed with HTTP ${response.status}.`);
+    }
+    return await response.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+async function probeSemanticBridge(endpoint) {
+  try {
+    const response = await fetchJson2(`${endpoint}/health`, SEMANTIC_STATUS_REQUEST_TIMEOUT_MS);
+    return normalizeSemanticHealth(response, endpoint);
+  } catch (error) {
+    return {
+      endpoint,
+      browserEndpoint: "",
+      status: "error",
+      model: null,
+      reason: normalizeError(error, "SEMANTIC_BRIDGE_UNAVAILABLE", { recoverable: true }).message,
+      observedAt: nowIso(),
+      lastError: normalizeError(error, "SEMANTIC_BRIDGE_UNAVAILABLE", { recoverable: true })
+    };
+  }
+}
+async function refreshSemanticState(endpoint = DEFAULT_SEMANTIC_ENDPOINT) {
+  const health = await probeSemanticBridge(endpoint);
+  return buildSemanticState(health);
+}
+async function requestSemanticObservation(snapshot, endpoint = DEFAULT_SEMANTIC_ENDPOINT) {
+  const instruction = semanticInstructionFromSnapshot(snapshot);
+  const payload = {
+    instruction,
+    pageUrl: snapshot.url,
+    pageTitle: snapshot.title,
+    snapshotSummary: snapshot.summary,
+    limit: 5
+  };
+  try {
+    const response = await fetchJson2(`${endpoint}/observe`, SEMANTIC_OBSERVE_REQUEST_TIMEOUT_MS, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+    return normalizeSemanticObservation(response, endpoint);
+  } catch (error) {
+    return normalizeSemanticObservation(
+      {
+        endpoint,
+        browserEndpoint: "",
+        status: "error",
+        model: null,
+        pageUrl: snapshot.url,
+        pageTitle: snapshot.title,
+        reason: normalizeError(error, "SEMANTIC_OBSERVE_FAILED", { recoverable: true }).message,
+        observedAt: nowIso(),
+        actions: []
+      },
+      endpoint
+    );
+  }
+}
+
 // src/shared/dom.ts
 function resolvePageStateFromSnapshot(snapshot) {
   return {
@@ -176,19 +1052,21 @@ function resolvePageStateFromSnapshot(snapshot) {
     formCount: snapshot.meta.formCount,
     visibleTextLength: snapshot.meta.visibleTextLength,
     hasSensitiveInputs: snapshot.meta.hasSensitiveInputs,
+    siteAdapterId: snapshot.siteAdapter?.id ?? null,
+    siteAdapterLabel: snapshot.siteAdapter?.label ?? null,
     updatedAt: snapshot.capturedAt
   };
 }
 
 // src/shared/messages.ts
-function isRecord(value) {
+function isRecord4(value) {
   return typeof value === "object" && value !== null;
 }
 function isUiRequest(value) {
-  return isRecord(value) && typeof value.kind === "string";
+  return isRecord4(value) && typeof value.kind === "string";
 }
 function isContentEvent(value) {
-  return isRecord(value) && typeof value.kind === "string";
+  return isRecord4(value) && typeof value.kind === "string";
 }
 
 // src/shared/storage.ts
@@ -224,6 +1102,9 @@ function createInitialState() {
   return {
     activeTabId: null,
     tabs: {},
+    bridge: createDisconnectedBridgeState(),
+    semantic: createDisabledSemanticState(),
+    workflow: createInitialWorkflowState(),
     status: "idle",
     lastUpdatedAt: nowIso()
   };
@@ -254,12 +1135,19 @@ function normalizeState(partial) {
   return {
     activeTabId: typeof partial.activeTabId === "number" ? partial.activeTabId : null,
     tabs,
+    bridge: partial.bridge ?? createDisconnectedBridgeState(),
+    semantic: partial.semantic ?? createDisabledSemanticState(),
+    workflow: normalizeWorkflowState(partial.workflow ?? createInitialWorkflowState()),
     status: partial.status ?? "idle",
     lastUpdatedAt: typeof partial.lastUpdatedAt === "string" ? partial.lastUpdatedAt : nowIso()
   };
 }
 var state = createInitialState();
 var persistTimer = null;
+var bridgeRefreshTimer = null;
+var bridgeRefreshInFlight = false;
+var semanticRefreshTimer = null;
+var semanticRefreshInFlight = false;
 function getTabState(tabId) {
   const existing = state.tabs[tabId];
   if (existing) {
@@ -369,6 +1257,113 @@ function commit(event) {
     broadcastEvent(event);
   }
 }
+async function refreshBridgeStatus() {
+  if (bridgeRefreshInFlight) {
+    return;
+  }
+  bridgeRefreshInFlight = true;
+  try {
+    state.bridge = await refreshBridgeState();
+    commit();
+  } finally {
+    bridgeRefreshInFlight = false;
+  }
+}
+function scheduleBridgePolling() {
+  if (bridgeRefreshTimer !== null) {
+    return;
+  }
+  bridgeRefreshTimer = globalThis.setInterval(() => {
+    void refreshBridgeStatus();
+  }, BRIDGE_POLL_INTERVAL_MS);
+}
+async function refreshSemanticStatus() {
+  if (semanticRefreshInFlight) {
+    return;
+  }
+  semanticRefreshInFlight = true;
+  try {
+    state.semantic = await refreshSemanticState();
+    commit();
+  } finally {
+    semanticRefreshInFlight = false;
+  }
+}
+function scheduleSemanticPolling() {
+  if (semanticRefreshTimer !== null) {
+    return;
+  }
+  semanticRefreshTimer = globalThis.setInterval(() => {
+    void refreshSemanticStatus();
+  }, SEMANTIC_POLL_INTERVAL_MS);
+}
+async function resolveSemanticTarget(tabId, selector) {
+  try {
+    const response = await sendContentRequest(tabId, { kind: "resolve-selector", selector });
+    if (response.kind !== "resolve-selector-result" || !response.elementId) {
+      return null;
+    }
+    return {
+      elementId: response.elementId,
+      label: response.label || response.tagName || selector
+    };
+  } catch {
+    return null;
+  }
+}
+async function mergeSemanticSuggestions(tabId, snapshot) {
+  const observation = await requestSemanticObservation(snapshot);
+  state.semantic = updateSemanticStateWithObservation(state.semantic, observation);
+  if (observation.status !== "ready" || observation.actions.length === 0) {
+    commit();
+    return;
+  }
+  const semanticSuggestions = await buildSemanticSuggestions(observation, snapshot, async (selector) => resolveSemanticTarget(tabId, selector));
+  if (semanticSuggestions.length === 0) {
+    commit();
+    return;
+  }
+  const mergedSnapshot = {
+    ...snapshot,
+    suggestedActions: [...snapshot.suggestedActions, ...semanticSuggestions]
+  };
+  replaceTabState(tabId, (current) => ({
+    ...current,
+    snapshot: mergedSnapshot,
+    pageState: resolvePageStateFromSnapshot(mergedSnapshot),
+    snapshotFresh: true,
+    lastSeenAt: nowIso()
+  }));
+  state.semantic = {
+    ...state.semantic,
+    observedAt: observation.observedAt,
+    pageUrl: observation.pageUrl,
+    pageTitle: observation.pageTitle,
+    suggestionCount: semanticSuggestions.length
+  };
+  pushLog(tabId, "success", "Added semantic suggestions from Stagehand.", `${semanticSuggestions.length} suggestion${semanticSuggestions.length === 1 ? "" : "s"} added.`);
+  commit({ kind: "page-snapshot", tabId, snapshot: mergedSnapshot });
+}
+function mergeWorkflowSuggestions(tabId, snapshot) {
+  const workflowSuggestions = buildWorkflowSuggestions(state.workflow, snapshot);
+  if (workflowSuggestions.length === 0) {
+    return;
+  }
+  const tabState = getTabState(tabId);
+  const currentSnapshot = tabState.snapshot ?? snapshot;
+  const mergedSnapshot = {
+    ...currentSnapshot,
+    suggestedActions: [...workflowSuggestions, ...currentSnapshot.suggestedActions]
+  };
+  replaceTabState(tabId, (current) => ({
+    ...current,
+    snapshot: mergedSnapshot,
+    pageState: resolvePageStateFromSnapshot(mergedSnapshot),
+    snapshotFresh: true,
+    lastSeenAt: nowIso()
+  }));
+  commit({ kind: "page-snapshot", tabId, snapshot: mergedSnapshot });
+}
 function setLastError(tabId, error) {
   replaceTabState(tabId, (current) => ({
     ...current,
@@ -418,10 +1413,11 @@ function setActiveTab(tabId) {
     };
   }
 }
-function updateTabContextFromChromeTab(tab) {
+function updateTabContextFromChromeTab(tab, options = {}) {
   if (typeof tab.id !== "number") {
     throw new Error("Tab is missing an id.");
   }
+  const markActive = options.markActive ?? true;
   const current = getTabState(tab.id);
   const nextUrl = tab.url ?? current.url;
   const nextTitle = tab.title ?? current.title;
@@ -430,7 +1426,7 @@ function updateTabContextFromChromeTab(tab) {
   const next = {
     ...current,
     windowId: tab.windowId ?? current.windowId,
-    active: Boolean(tab.active) || state.activeTabId === tab.id,
+    active: markActive ? Boolean(tab.active) || state.activeTabId === tab.id : state.activeTabId === tab.id,
     url: nextUrl,
     title: nextTitle,
     pageState: current.pageState ? {
@@ -443,10 +1439,10 @@ function updateTabContextFromChromeTab(tab) {
     lastSeenAt: nowIso()
   };
   state.tabs[tab.id] = next;
-  if (tab.active) {
+  if (markActive && tab.active) {
     setActiveTab(tab.id);
   }
-  if (urlChanged || titleChanged) {
+  if ((urlChanged || titleChanged) && options.logChanges !== false) {
     pushLog(tab.id, "info", "Tab context updated.", `${nextTitle || "Untitled"} | ${nextUrl || "unknown url"}`);
   }
   return next;
@@ -462,6 +1458,56 @@ async function syncActiveTab(tabId) {
     const normalized = normalizeError(error, "TAB_SYNC_FAILED", { tabId, recoverable: true });
     setLastError(tabId, normalized);
     pushLog(tabId, "error", "Failed to sync active tab.", normalized.message);
+    commit({ kind: "error", error: normalized });
+    return null;
+  }
+}
+async function refreshKnownTabs() {
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs) {
+      if (typeof tab.id !== "number") {
+        continue;
+      }
+      updateTabContextFromChromeTab(tab, { markActive: false, logChanges: false });
+    }
+    const activeTabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    const activeTab = activeTabs.find((tab) => typeof tab.id === "number") ?? null;
+    if (activeTab) {
+      updateTabContextFromChromeTab(activeTab, { markActive: true, logChanges: false });
+    } else if (state.activeTabId !== null && !state.tabs[state.activeTabId]) {
+      state.activeTabId = null;
+    }
+    commit();
+  } catch (error) {
+    const normalized = normalizeError(error, "TAB_REFRESH_FAILED", { recoverable: true });
+    const tabId = state.activeTabId ?? null;
+    if (tabId !== null) {
+      setLastError(tabId, normalized);
+      pushLog(tabId, "error", "Failed to refresh tab inventory.", normalized.message);
+    }
+    commit({ kind: "error", error: normalized });
+  }
+}
+async function focusTrackedTab(tabId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (typeof tab.windowId === "number") {
+      try {
+        await chrome.windows.update(tab.windowId, { focused: true });
+      } catch {
+      }
+    }
+    await chrome.tabs.update(tabId, { active: true });
+    const synced = await syncActiveTab(tabId);
+    if (synced) {
+      pushLog(tabId, "info", "Focused tab.", summarizeTrackedTab(synced));
+    }
+    return synced;
+  } catch (error) {
+    const normalized = normalizeError(error, "TAB_FOCUS_FAILED", { tabId, recoverable: true });
+    setLastError(tabId, normalized);
+    pushLog(tabId, "error", "Failed to focus tab.", normalized.message);
     commit({ kind: "error", error: normalized });
     return null;
   }
@@ -533,11 +1579,12 @@ async function recordSnapshot(tabId, mode) {
     lastError: null,
     lastSeenAt: nowIso()
   }));
+  state.workflow = recordWorkflowPageState(state.workflow, tabId, pageState, snapshot);
   pushLog(tabId, "success", `Captured ${mode} page snapshot.`, `Interactive controls: ${snapshot.interactiveElements.length}`);
   commit({ kind: "page-snapshot", tabId, snapshot });
   return snapshot;
 }
-async function scanActiveTab(mode) {
+async function scanActiveTab(mode, workflowContext = null) {
   const tabId = state.activeTabId;
   if (tabId === null) {
     const error = normalizeError("No active tab is available.", "NO_ACTIVE_TAB", { recoverable: true });
@@ -558,9 +1605,22 @@ async function scanActiveTab(mode) {
   markBusy(tabId, true);
   commit();
   try {
-    await recordSnapshot(tabId, mode);
+    const snapshot = await recordSnapshot(tabId, mode);
+    if (workflowContext?.workflowId && workflowContext.workflowStepId) {
+      state.workflow = markWorkflowRequestCompleted(state.workflow, workflowContext, snapshot.summary);
+      commit();
+    }
+    if (mode === "suggestions" && state.semantic.status === "ready") {
+      await mergeSemanticSuggestions(tabId, snapshot);
+    }
+    if (mode === "suggestions") {
+      mergeWorkflowSuggestions(tabId, snapshot);
+    }
   } catch (error) {
     const normalized = normalizeError(error, "CAPTURE_FAILED", { tabId, recoverable: true });
+    if (workflowContext?.workflowId && workflowContext.workflowStepId) {
+      state.workflow = markWorkflowRequestFailed(state.workflow, workflowContext, normalized.message);
+    }
     setLastError(tabId, normalized);
     markContentReady(tabId, false);
     pushLog(tabId, "error", "Failed to capture the page.", `${normalized.message}${normalized.details ? ` | ${normalized.details}` : ""}`);
@@ -569,6 +1629,28 @@ async function scanActiveTab(mode) {
     markBusy(tabId, false);
     commit();
   }
+}
+async function scanTrackedTab(tabId, mode, workflowContext = null) {
+  const tabState = getTabState(tabId);
+  if (!isInspectableUrl(tabState.url)) {
+    const error = normalizeError(`The tab cannot be inspected: ${tabState.url || "unknown url"}`, "UNSUPPORTED_URL", {
+      tabId,
+      recoverable: true
+    });
+    setLastError(tabId, error);
+    pushLog(tabId, "warning", "Scan blocked because the selected tab is not inspectable.", error.message);
+    commit({ kind: "error", error });
+    return;
+  }
+  if (state.activeTabId !== tabId) {
+    const focused = await focusTrackedTab(tabId);
+    if (!focused) {
+      return;
+    }
+  } else {
+    await syncActiveTab(tabId);
+  }
+  await scanActiveTab(mode, workflowContext);
 }
 function pruneApprovals(approvals) {
   return truncateEntries(approvals, MAX_APPROVAL_QUEUE_ENTRIES);
@@ -583,6 +1665,7 @@ async function queueActionForApproval(action) {
   const tabState = getTabState(tabId);
   const snapshot = tabState.snapshot;
   if (isBlockedSensitiveAction(action, snapshot)) {
+    state.workflow = markWorkflowStepFailed(state.workflow, action, "Sensitive fields are not supported in v1.");
     const error = normalizeError("Sensitive form fields are not supported in v1.", "SENSITIVE_FIELD_BLOCKED", {
       tabId,
       recoverable: true
@@ -592,6 +1675,7 @@ async function queueActionForApproval(action) {
     commit({ kind: "error", error });
     return;
   }
+  state.workflow = markWorkflowStepQueued(state.workflow, action);
   action.tabId = tabId;
   const approval = buildApprovalRequest(action, tabId, snapshot);
   replaceTabState(tabId, (current) => ({
@@ -643,10 +1727,12 @@ async function executeApprovedAction(tabId, action, approvalId) {
         lastSeenAt: nowIso()
       };
     });
+    state.workflow = markWorkflowStepCompleted(state.workflow, action, result.message);
     pushLog(tabId, "success", `Executed ${actionLabel}.`, result.message);
     commit({ kind: "action-result", result });
   } catch (error) {
     const normalized = normalizeError(error, "ACTION_FAILED", { tabId, recoverable: true });
+    state.workflow = markWorkflowStepFailed(state.workflow, action, normalized.message);
     setLastError(tabId, normalized);
     replaceTabState(tabId, (current) => ({
       ...current,
@@ -708,6 +1794,7 @@ async function rejectAction(approvalId) {
     status: "rejected",
     updatedAt: nowIso()
   };
+  state.workflow = markWorkflowStepFailed(state.workflow, approval.action, "Rejected by user.");
   replaceTabState(tabId, (current) => ({
     ...current,
     approvals: current.approvals.map((entry) => entry.approvalId === approvalId ? updated : entry),
@@ -747,28 +1834,89 @@ function clearActiveTabLog() {
 async function handleUiRequest(port, request) {
   switch (request.kind) {
     case "get-state":
+      await refreshKnownTabs();
       port.postMessage({ kind: "state", state });
+      void refreshBridgeStatus();
+      void refreshSemanticStatus();
       return;
     case "scan-page":
-      await scanActiveTab(request.mode);
+      await scanActiveTab(
+        request.mode,
+        request.workflowId || request.workflowStepId ? {
+          ...request.workflowId ? { workflowId: request.workflowId } : {},
+          ...request.workflowStepId ? { workflowStepId: request.workflowStepId } : {}
+        } : null
+      );
       return;
     case "list-interactive-elements":
-      await scanActiveTab("interactive");
+      await scanActiveTab(
+        "interactive",
+        request.workflowId || request.workflowStepId ? {
+          ...request.workflowId ? { workflowId: request.workflowId } : {},
+          ...request.workflowStepId ? { workflowStepId: request.workflowStepId } : {}
+        } : null
+      );
       return;
     case "summarize-page":
-      await scanActiveTab("summary");
+      await scanActiveTab(
+        "summary",
+        request.workflowId || request.workflowStepId ? {
+          ...request.workflowId ? { workflowId: request.workflowId } : {},
+          ...request.workflowStepId ? { workflowStepId: request.workflowStepId } : {}
+        } : null
+      );
       return;
     case "suggest-next-actions":
-      await scanActiveTab("suggestions");
+      await scanActiveTab(
+        "suggestions",
+        request.workflowId || request.workflowStepId ? {
+          ...request.workflowId ? { workflowId: request.workflowId } : {},
+          ...request.workflowStepId ? { workflowStepId: request.workflowStepId } : {}
+        } : null
+      );
       return;
     case "request-action":
       await queueActionForApproval(request.action);
+      return;
+    case "plan-workflow":
+      state.workflow = recordWorkflowPlan(state.workflow, request.workflow, getActiveTabState()?.snapshot ?? null);
+      if (state.activeTabId !== null) {
+        pushLog(
+          state.activeTabId,
+          "info",
+          "Planned a workflow.",
+          `${request.workflow.steps.length} step${request.workflow.steps.length === 1 ? "" : "s"} · ${request.workflow.objective}`
+        );
+      }
+      commit();
+      return;
+    case "refresh-tabs":
+      await refreshKnownTabs();
+      return;
+    case "focus-tab":
+      await focusTrackedTab(request.tabId);
+      return;
+    case "scan-tab":
+      await scanTrackedTab(
+        request.tabId,
+        request.mode,
+        request.workflowId || request.workflowStepId ? {
+          ...request.workflowId ? { workflowId: request.workflowId } : {},
+          ...request.workflowStepId ? { workflowStepId: request.workflowStepId } : {}
+        } : null
+      );
       return;
     case "approve-action":
       await approveAction(request.approvalId);
       return;
     case "reject-action":
       await rejectAction(request.approvalId);
+      return;
+    case "refresh-bridge":
+      await refreshBridgeStatus();
+      return;
+    case "refresh-semantic":
+      await refreshSemanticStatus();
       return;
     case "open-sidepanel":
       await openSidePanel();
@@ -807,6 +1955,7 @@ async function handleContentEvent(message, sender) {
         lastError: null,
         lastSeenAt: nowIso()
       }));
+      state.workflow = recordWorkflowPageState(state.workflow, tabId, nextState, null);
       commit();
       return;
     }
@@ -834,6 +1983,10 @@ chrome.runtime.onConnect.addListener((port) => {
   }
   uiPorts.add(port);
   port.postMessage({ kind: "state", state });
+  void refreshBridgeStatus();
+  void refreshSemanticStatus();
+  scheduleBridgePolling();
+  scheduleSemanticPolling();
   port.onMessage.addListener((message) => {
     if (!isUiRequest(message)) {
       return;
@@ -845,6 +1998,14 @@ chrome.runtime.onConnect.addListener((port) => {
   });
   port.onDisconnect.addListener(() => {
     uiPorts.delete(port);
+    if (uiPorts.size === 0 && bridgeRefreshTimer !== null) {
+      clearInterval(bridgeRefreshTimer);
+      bridgeRefreshTimer = null;
+    }
+    if (uiPorts.size === 0 && semanticRefreshTimer !== null) {
+      clearInterval(semanticRefreshTimer);
+      semanticRefreshTimer = null;
+    }
   });
 });
 chrome.runtime.onMessage.addListener((message, sender) => {
@@ -863,6 +2024,13 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 });
 chrome.tabs.onActivated.addListener(({ tabId }) => {
   void syncActiveTab(tabId);
+});
+chrome.tabs.onCreated.addListener((tab) => {
+  if (typeof tab.id !== "number") {
+    return;
+  }
+  updateTabContextFromChromeTab(tab, { markActive: false, logChanges: false });
+  commit();
 });
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   const tabState = getTabState(tabId);
@@ -896,14 +2064,24 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
   delete state.tabs[tabId];
-  if (state.activeTabId === tabId) {
+  const wasActive = state.activeTabId === tabId;
+  if (wasActive) {
     state.activeTabId = null;
   }
   commit();
+  if (wasActive) {
+    void refreshKnownTabs();
+  }
 });
 chrome.runtime.onInstalled.addListener(() => {
   void persistState();
+  void refreshKnownTabs();
+  void refreshBridgeStatus();
+  void refreshSemanticStatus();
   updateBadge();
+});
+chrome.runtime.onStartup.addListener(() => {
+  void refreshKnownTabs();
 });
 chrome.action.setBadgeText({ text: "" }).catch(() => void 0);
 //# sourceMappingURL=background.js.map

@@ -37,6 +37,245 @@
     };
   }
 
+  // src/shared/action-policy.ts
+  var DANGEROUS_KEYWORDS = [
+    "delete",
+    "remove",
+    "submit",
+    "confirm",
+    "purchase",
+    "pay",
+    "checkout",
+    "unsubscribe",
+    "sign out",
+    "log out",
+    "logoff",
+    "close account",
+    "cancel",
+    "post",
+    "publish"
+  ];
+  function isLikelySensitiveSnapshot(snapshot) {
+    return Boolean(snapshot?.meta.hasSensitiveInputs || snapshot?.pageKind === "login");
+  }
+  function classifyDanger(action, snapshot) {
+    if (action.kind === "submit-form") {
+      return "high";
+    }
+    if (action.kind === "type") {
+      return isLikelySensitiveSnapshot(snapshot) ? "high" : "medium";
+    }
+    if (action.kind === "select") {
+      return "medium";
+    }
+    if (action.kind === "click") {
+      const label = (action.label ?? "").toLowerCase();
+      if (DANGEROUS_KEYWORDS.some((keyword) => label.includes(keyword))) {
+        return "high";
+      }
+      return "medium";
+    }
+    return "low";
+  }
+
+  // src/shared/site-adapters.ts
+  function normalize(input) {
+    return input.trim().replace(/\s+/g, " ").toLowerCase();
+  }
+  function hostFromUrl(url) {
+    try {
+      return new URL(url).hostname.toLowerCase().replace(/^www\./, "");
+    } catch {
+      return "";
+    }
+  }
+  function makeSuggestionId(prefix) {
+    return globalThis.crypto?.randomUUID?.() ?? `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  }
+  function matchInteractiveElement(elements, matcher) {
+    for (const element of elements) {
+      if (matcher(element)) {
+        return element;
+      }
+    }
+    return null;
+  }
+  function buildClickSuggestion(snapshot, element, title, description) {
+    return {
+      id: makeSuggestionId(`site-${snapshot.snapshotId}`),
+      title,
+      description,
+      buttonLabel: "Queue",
+      request: {
+        kind: "request-action",
+        action: {
+          actionId: makeSuggestionId("action"),
+          tabId: snapshot.tabId,
+          kind: "click",
+          elementId: element.elementId,
+          label: element.label || element.text || title,
+          selector: element.selector
+        }
+      },
+      approvalRequired: true,
+      dangerLevel: classifyDanger(
+        {
+          actionId: "preview",
+          tabId: snapshot.tabId,
+          kind: "click",
+          elementId: element.elementId,
+          label: element.label || element.text || title,
+          selector: element.selector
+        },
+        snapshot
+      ),
+      source: "site",
+      selector: element.selector,
+      confidence: 0.9
+    };
+  }
+  function buildAdapterSummary(id, label, kind, summary, capabilities, notes) {
+    return {
+      id,
+      label,
+      kind,
+      summary,
+      capabilities,
+      notes
+    };
+  }
+  function resolveSiteAdapterFromState(state) {
+    const hostname = hostFromUrl(state.url);
+    const title = normalize(state.title);
+    if (!hostname) {
+      return null;
+    }
+    if (hostname === "accounts.google.com" || hostname.endsWith("google.com") && state.pageKind === "login" && title.includes("sign in")) {
+      return buildAdapterSummary(
+        "google-login",
+        "Google sign-in",
+        "workspace-login",
+        "Google sign-in is active. Sign in manually, then rescan so CBC can continue with the authenticated session.",
+        ["manual sign-in", "session resume", "approval-gated follow-up"],
+        ["CBC will not type passwords or bypass Google account security prompts."]
+      );
+    }
+    if (hostname === "drive.google.com") {
+      return buildAdapterSummary(
+        "google-drive",
+        "Google Drive",
+        "workspace-app",
+        "Google Drive is active. Use the New button or recent-file shortcuts to create or open documents.",
+        ["new document", "recent files", "workspace navigation"],
+        ["Use a rescan after opening or creating a file so the tab inventory stays fresh."]
+      );
+    }
+    if (hostname === "docs.google.com") {
+      return buildAdapterSummary(
+        "google-docs",
+        "Google Docs editor",
+        "document-editor",
+        "Google Docs is ready. The document canvas can be focused and typed into after approval.",
+        ["document typing", "editor focus", "toolbar navigation"],
+        ["If the editor is still loading, rescan after the contenteditable surface appears."]
+      );
+    }
+    if (hostname.endsWith("linkedin.com")) {
+      if (state.pageKind === "login" || title.includes("sign in") || title.includes("log in")) {
+        return buildAdapterSummary(
+          "linkedin-login",
+          "LinkedIn sign-in",
+          "workspace-login",
+          "LinkedIn sign-in is active. Enter credentials manually, then rescan to continue the feed workflow.",
+          ["manual sign-in", "feed resume", "approval-gated follow-up"],
+          ["CBC will not type passwords into LinkedIn login forms."]
+        );
+      }
+      return buildAdapterSummary(
+        "linkedin-feed",
+        "LinkedIn feed",
+        "social-feed",
+        "LinkedIn feed or profile content is visible. Use the visible post actions to inspect or engage with the feed.",
+        ["feed navigation", "post engagement", "profile inspection"],
+        ["Rescan after feed changes so the active tab snapshot stays current."]
+      );
+    }
+    return null;
+  }
+  function findDocumentBodyTarget(snapshot) {
+    return matchInteractiveElement(snapshot.interactiveElements, (element) => {
+      const tagName = element.tagName.toLowerCase();
+      const role = element.role.toLowerCase();
+      return !element.isSensitive && (element.contentEditable === true || tagName === "textarea" || role === "textbox");
+    });
+  }
+  function findLinkedInLikeTarget(snapshot) {
+    return matchInteractiveElement(snapshot.interactiveElements, (element) => {
+      const haystack = normalize([element.label, element.text, element.name ?? "", element.placeholder ?? "", element.selector, element.role, element.type ?? ""].join(" "));
+      return !element.isSensitive && (haystack.includes("like") || haystack.includes("react"));
+    });
+  }
+  function findGoogleDriveNewTarget(snapshot) {
+    return matchInteractiveElement(snapshot.interactiveElements, (element) => {
+      const haystack = normalize([element.label, element.text, element.name ?? "", element.placeholder ?? "", element.selector, element.role, element.type ?? ""].join(" "));
+      return !element.isSensitive && (haystack === "new" || haystack.includes("new ") || haystack.includes("blank") || haystack.includes("create"));
+    });
+  }
+  function resolveSiteAdapterSnapshot(snapshot) {
+    const siteAdapter = resolveSiteAdapterFromState({
+      url: snapshot.url,
+      title: snapshot.title,
+      pageKind: snapshot.pageKind
+    });
+    const suggestions = [];
+    if (!siteAdapter) {
+      return { siteAdapter: null, suggestions };
+    }
+    if (siteAdapter.id === "google-docs") {
+      const target = findDocumentBodyTarget(snapshot);
+      if (target) {
+        suggestions.push(
+          buildClickSuggestion(
+            snapshot,
+            target,
+            "Focus document body",
+            "Focus the document canvas so the next approved typing action lands in the editor."
+          )
+        );
+      }
+    }
+    if (siteAdapter.id === "google-drive") {
+      const target = findGoogleDriveNewTarget(snapshot);
+      if (target) {
+        suggestions.push(
+          buildClickSuggestion(
+            snapshot,
+            target,
+            "Open the New menu",
+            "Open the Drive New menu so you can create a new document or file after approval."
+          )
+        );
+      }
+    }
+    if (siteAdapter.id === "linkedin-feed") {
+      const target = findLinkedInLikeTarget(snapshot);
+      if (target) {
+        suggestions.push(
+          buildClickSuggestion(
+            snapshot,
+            target,
+            "Like the first visible post",
+            "Click the first visible Like control in the LinkedIn feed after you review it."
+          )
+        );
+      }
+    }
+    return {
+      siteAdapter,
+      suggestions
+    };
+  }
+
   // src/shared/dom.ts
   function createRegistryHandle() {
     const elementToId = /* @__PURE__ */ new WeakMap();
@@ -440,12 +679,18 @@
     }
     return "document";
   }
-  function summarizePageState(state, headings, forms, interactiveCount) {
+  function summarizePageState(state, headings, forms, interactiveCount, siteAdapter) {
     const kindLabel = state.pageKind === "unknown" ? "page" : `${state.pageKind} page`;
     const parts = [
       `${state.title || "Untitled"} on ${new URL(state.url).hostname}.`,
       `This is a ${kindLabel} with ${headings.length} heading${headings.length === 1 ? "" : "s"}, ${forms.length} form${forms.length === 1 ? "" : "s"}, and ${interactiveCount} interactive control${interactiveCount === 1 ? "" : "s"}.`
     ];
+    if (siteAdapter) {
+      parts.push(siteAdapter.summary);
+      if (siteAdapter.notes.length > 0) {
+        parts.push(siteAdapter.notes[0]);
+      }
+    }
     if (state.hasSensitiveInputs) {
       parts.push("Sensitive inputs are present. Password values are not captured and the extension will not type into them.");
     }
@@ -463,7 +708,10 @@
         buttonLabel: "Summarize",
         request: { kind: "scan-page", mode: "summary" },
         approvalRequired: false,
-        dangerLevel: "low"
+        dangerLevel: "low",
+        source: "dom",
+        selector: void 0,
+        confidence: void 0
       },
       {
         id: "list-interactive-elements",
@@ -472,7 +720,10 @@
         buttonLabel: "Inspect",
         request: { kind: "scan-page", mode: "interactive" },
         approvalRequired: false,
-        dangerLevel: "low"
+        dangerLevel: "low",
+        source: "dom",
+        selector: void 0,
+        confidence: void 0
       }
     ];
     if (snapshot.pageKind === "article") {
@@ -483,7 +734,10 @@
         buttonLabel: "Review",
         request: { kind: "scan-page", mode: "summary" },
         approvalRequired: false,
-        dangerLevel: "low"
+        dangerLevel: "low",
+        source: "dom",
+        selector: void 0,
+        confidence: void 0
       });
     }
     if (snapshot.pageKind === "form" || snapshot.pageKind === "login") {
@@ -494,7 +748,10 @@
         buttonLabel: "Review",
         request: { kind: "scan-page", mode: "interactive" },
         approvalRequired: false,
-        dangerLevel: "low"
+        dangerLevel: "low",
+        source: "dom",
+        selector: void 0,
+        confidence: void 0
       });
     }
     if (snapshot.pageKind === "spa") {
@@ -505,7 +762,10 @@
         buttonLabel: "Rescan",
         request: { kind: "scan-page", mode: "full" },
         approvalRequired: false,
-        dangerLevel: "low"
+        dangerLevel: "low",
+        source: "dom",
+        selector: void 0,
+        confidence: void 0
       });
     }
     return suggestions.slice(0, 4);
@@ -527,11 +787,47 @@
       formCount: forms.length,
       visibleTextLength: visibleText.length,
       hasSensitiveInputs: forms.some((form) => form.hasPasswordField || form.hasFileField),
+      siteAdapterId: null,
+      siteAdapterLabel: null,
       updatedAt: toIso()
     };
     const pageKind = derivePageKind(pageState, headings, forms);
     const completedState = { ...pageState, pageKind };
     const semanticOutline = captureSemanticOutline(document2, headings);
+    const siteResolution = resolveSiteAdapterSnapshot({
+      snapshotId: "",
+      tabId: -1,
+      url: document2.location.href,
+      title: completedState.title,
+      captureMode: options.mode,
+      capturedAt: toIso(),
+      pageKind,
+      navigationMode: options.navigationMode,
+      visibleText,
+      visibleTextExcerpt: "",
+      textLength: visibleText.length,
+      meta: {
+        navigationMode: options.navigationMode,
+        readyState: document2.readyState,
+        interactiveCount: interactiveElements.length,
+        linkCount: links.length,
+        formCount: forms.length,
+        headingCount: headings.length,
+        visibleTextLength: visibleText.length,
+        hasSensitiveInputs: completedState.hasSensitiveInputs,
+        isArticleLike: pageKind === "article",
+        isLoginLike: pageKind === "login",
+        isSinglePageApp: options.navigationMode === "spa"
+      },
+      headings,
+      links,
+      forms,
+      interactiveElements,
+      semanticOutline,
+      siteAdapter: null,
+      suggestedActions: [],
+      summary: ""
+    });
     const snapshotBase = {
       snapshotId: globalThis.crypto?.randomUUID?.() ?? `snapshot_${Date.now()}_${Math.random().toString(16).slice(2)}`,
       tabId: -1,
@@ -561,18 +857,20 @@
       links,
       forms,
       interactiveElements,
-      semanticOutline
+      semanticOutline,
+      siteAdapter: siteResolution.siteAdapter
     };
     const snapshot = {
       ...snapshotBase,
-      summary: summarizePageState(completedState, headings, forms, interactiveElements.length),
+      summary: summarizePageState(completedState, headings, forms, interactiveElements.length, siteResolution.siteAdapter),
       suggestedActions: buildSuggestedActions({
         ...snapshotBase,
+        siteAdapter: siteResolution.siteAdapter,
         summary: "",
         suggestedActions: []
       })
     };
-    snapshot.suggestedActions = buildSuggestedActions(snapshot);
+    snapshot.suggestedActions = [...snapshot.suggestedActions, ...siteResolution.suggestions];
     return { snapshot, registry: registry.registry };
   }
   function createActionResult(action, tabId, success, message, details, approvalId) {
@@ -592,6 +890,9 @@
       return action.amount || DEFAULT_SCROLL_AMOUNT;
     }
     return DEFAULT_SCROLL_AMOUNT;
+  }
+  function getElementTextSnapshot(element) {
+    return getTextSnippet(element, 160);
   }
   function isSensitiveElement(element) {
     return isSensitiveField(element);
@@ -616,6 +917,9 @@
     lastSnapshot: null,
     mutationTimer: null
   };
+  function makeId(prefix) {
+    return globalThis.crypto?.randomUUID?.() ?? `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  }
   function getNavigationMode() {
     return runtimeState.navigationMode;
   }
@@ -643,6 +947,8 @@
       formCount: pageState.meta.formCount,
       visibleTextLength: pageState.meta.visibleTextLength,
       hasSensitiveInputs: pageState.meta.hasSensitiveInputs,
+      siteAdapterId: pageState.siteAdapter?.id ?? null,
+      siteAdapterLabel: pageState.siteAdapter?.label ?? null,
       updatedAt: nowIso()
     };
     await chrome.runtime.sendMessage({
@@ -714,30 +1020,115 @@
   function resolveRegistryElement(elementId) {
     return runtimeState.registry.get(elementId) ?? null;
   }
+  function registerResolvedElement(element) {
+    for (const [elementId2, registeredElement] of runtimeState.registry.entries()) {
+      if (registeredElement === element) {
+        return elementId2;
+      }
+    }
+    const elementId = makeId("element");
+    runtimeState.registry.set(elementId, element);
+    return elementId;
+  }
+  function resolveSelectorWithXPath(selector) {
+    const normalized = selector.trim().replace(/^xpath=/i, "");
+    if (!normalized) {
+      return null;
+    }
+    try {
+      const result = document.evaluate(normalized, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+      return result.singleNodeValue instanceof HTMLElement ? result.singleNodeValue : null;
+    } catch {
+      return null;
+    }
+  }
+  function resolveSelectorByText(selector) {
+    const comparable = normalizeComparable(selector.replace(/^text=/i, "").replace(/^aria=/i, ""));
+    if (!comparable) {
+      return null;
+    }
+    const candidates = Array.from(runtimeState.registry.values()).filter((element) => element instanceof HTMLElement);
+    for (const element of candidates) {
+      const label = normalizeComparable(
+        `${element.getAttribute("aria-label") ?? ""} ${element.getAttribute("title") ?? ""} ${getElementTextSnapshot(element)}`
+      );
+      if (label.includes(comparable)) {
+        return element;
+      }
+    }
+    return null;
+  }
+  function resolveSelectorToElement(selector) {
+    const normalized = selector.trim();
+    if (!normalized) {
+      return null;
+    }
+    for (const element of runtimeState.registry.values()) {
+      if (!(element instanceof HTMLElement)) {
+        continue;
+      }
+      try {
+        if (element.matches(normalized)) {
+          return element;
+        }
+      } catch {
+      }
+    }
+    try {
+      const cssMatch = document.querySelector(normalized);
+      if (cssMatch instanceof HTMLElement) {
+        return cssMatch;
+      }
+    } catch {
+    }
+    if (normalized.startsWith("xpath=") || normalized.startsWith("/")) {
+      const xpathMatch = resolveSelectorWithXPath(normalized);
+      if (xpathMatch) {
+        return xpathMatch;
+      }
+    }
+    const textMatch = resolveSelectorByText(normalized);
+    if (textMatch) {
+      return textMatch;
+    }
+    return null;
+  }
+  function resolveActionTarget(action) {
+    const targetById = "elementId" in action ? resolveRegistryElement(action.elementId) : null;
+    if (targetById) {
+      return targetById;
+    }
+    if ("selector" in action && action.selector) {
+      return resolveSelectorToElement(action.selector);
+    }
+    return null;
+  }
   async function performAction(action) {
     const startedAt = nowIso();
     switch (action.kind) {
       case "click": {
-        const target = resolveRegistryElement(action.elementId);
+        const target = resolveActionTarget(action);
         if (!target) {
           throw new Error(`The target element "${action.elementId}" is no longer available.`);
         }
         if (isSensitiveElement(target)) {
           throw new Error("Sensitive fields are blocked.");
         }
+        registerResolvedElement(target);
         target.focus?.();
         target.click();
         schedulePageStateBroadcast("mutation");
         return createActionResult(action, action.tabId, true, "Clicked the selected element.", `Target: ${target.tagName.toLowerCase()}.`);
       }
       case "type": {
-        const target = resolveRegistryElement(action.elementId);
+        const target = resolveActionTarget(action);
         if (!target || !(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target.isContentEditable)) {
           throw new Error(`The target input "${action.elementId}" is no longer available.`);
         }
         if (isSensitiveElement(target)) {
           throw new Error("Sensitive fields are blocked.");
         }
+        registerResolvedElement(target);
         if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
           target.focus();
           const nextValue = action.clearBeforeTyping === false ? `${getFieldValue(target)}${action.text}` : action.text;
@@ -758,10 +1149,11 @@
         return createActionResult(action, action.tabId, true, "Typed text into the selected field.", `Inserted ${action.text.length} characters.`);
       }
       case "select": {
-        const target = resolveRegistryElement(action.elementId);
+        const target = resolveActionTarget(action);
         if (!target || !(target instanceof HTMLSelectElement)) {
           throw new Error(`The target dropdown "${action.elementId}" is no longer available.`);
         }
+        registerResolvedElement(target);
         const selectedLabel = selectOption(target, action);
         schedulePageStateBroadcast("mutation");
         return createActionResult(action, action.tabId, true, "Selected a dropdown option.", `Selected ${selectedLabel}.`);
@@ -790,10 +1182,11 @@
         return createActionResult(action, action.tabId, true, "Reloaded the current page.", `Started at ${startedAt}.`);
       }
       case "submit-form": {
-        const target = resolveRegistryElement(action.elementId);
+        const target = resolveActionTarget(action);
         if (!target) {
           throw new Error(`The target form "${action.elementId}" is no longer available.`);
         }
+        registerResolvedElement(target);
         const form = target instanceof HTMLFormElement ? target : target.closest("form");
         if (!form) {
           throw new Error("No form was found for the selected target.");
@@ -855,6 +1248,18 @@
             sendResponse({
               kind: "page-snapshot",
               snapshot: capture.snapshot
+            });
+            return;
+          }
+          case "resolve-selector": {
+            const target = resolveSelectorToElement(message.selector);
+            const elementId = target ? registerResolvedElement(target) : null;
+            sendResponse({
+              kind: "resolve-selector-result",
+              selector: message.selector,
+              elementId,
+              tagName: target?.tagName.toLowerCase() ?? null,
+              label: target ? getElementTextSnapshot(target) || target.getAttribute("aria-label") || target.getAttribute("title") || target.tagName.toLowerCase() : null
             });
             return;
           }

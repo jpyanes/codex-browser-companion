@@ -1,10 +1,13 @@
 import {
+  BRIDGE_POLL_INTERVAL_MS,
   CONTENT_SCRIPT_READY_RETRIES,
   CONTENT_SCRIPT_RETRY_DELAY_MS,
   MAX_ACTIVITY_LOG_ENTRIES,
   MAX_APPROVAL_QUEUE_ENTRIES,
+  SEMANTIC_POLL_INTERVAL_MS,
   STORAGE_KEY_STATE,
 } from "../shared/constants";
+import { createDisconnectedBridgeState } from "../shared/bridge";
 import {
   buildApprovalRequest,
   canAutoExecute,
@@ -12,6 +15,23 @@ import {
   isBlockedSensitiveAction,
   requiresApproval,
 } from "../shared/action-policy";
+import { refreshBridgeState } from "./bridge-client";
+import { createDisabledSemanticState, updateSemanticStateWithObservation } from "../shared/semantic";
+import { buildSemanticSuggestions } from "../shared/semantic";
+import {
+  buildWorkflowSuggestions,
+  createInitialWorkflowState,
+  markWorkflowRequestCompleted,
+  markWorkflowRequestFailed,
+  markWorkflowStepCompleted,
+  markWorkflowStepFailed,
+  markWorkflowStepQueued,
+  normalizeWorkflowState,
+  recordWorkflowPageState,
+  recordWorkflowPlan,
+} from "../shared/workflow";
+import { summarizeTrackedTab } from "../shared/tab-orchestration";
+import { requestSemanticObservation, refreshSemanticState } from "./semantic-client";
 import { resolvePageStateFromSnapshot } from "../shared/dom";
 import { createActivityLogEntry, normalizeError, nowIso } from "../shared/logger";
 import { isContentEvent, isUiRequest, type ContentRequest, type ContentResponse, type UiEvent, type UiRequest } from "../shared/messages";
@@ -28,6 +48,11 @@ import type {
 } from "../shared/types";
 
 const uiPorts = new Set<chrome.runtime.Port>();
+
+interface UpdateTabContextOptions {
+  markActive?: boolean;
+  logChanges?: boolean;
+}
 
 function makeId(prefix: string): string {
   return globalThis.crypto?.randomUUID?.() ?? `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
@@ -56,6 +81,9 @@ function createInitialState(): ExtensionState {
   return {
     activeTabId: null,
     tabs: {},
+    bridge: createDisconnectedBridgeState(),
+    semantic: createDisabledSemanticState(),
+    workflow: createInitialWorkflowState(),
     status: "idle",
     lastUpdatedAt: nowIso(),
   };
@@ -91,6 +119,9 @@ function normalizeState(partial: Partial<ExtensionState> | undefined | null): Ex
   return {
     activeTabId: typeof partial.activeTabId === "number" ? partial.activeTabId : null,
     tabs,
+    bridge: partial.bridge ?? createDisconnectedBridgeState(),
+    semantic: partial.semantic ?? createDisabledSemanticState(),
+    workflow: normalizeWorkflowState(partial.workflow ?? createInitialWorkflowState()),
     status: partial.status ?? "idle",
     lastUpdatedAt: typeof partial.lastUpdatedAt === "string" ? partial.lastUpdatedAt : nowIso(),
   };
@@ -98,6 +129,10 @@ function normalizeState(partial: Partial<ExtensionState> | undefined | null): Ex
 
 let state: ExtensionState = createInitialState();
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
+let bridgeRefreshTimer: ReturnType<typeof setInterval> | null = null;
+let bridgeRefreshInFlight = false;
+let semanticRefreshTimer: ReturnType<typeof setInterval> | null = null;
+let semanticRefreshInFlight = false;
 
 function getTabState(tabId: number): TrackedTabState {
   const existing = state.tabs[tabId];
@@ -233,6 +268,134 @@ function commit(event?: UiEvent): void {
   }
 }
 
+async function refreshBridgeStatus(): Promise<void> {
+  if (bridgeRefreshInFlight) {
+    return;
+  }
+
+  bridgeRefreshInFlight = true;
+  try {
+    state.bridge = await refreshBridgeState();
+    commit();
+  } finally {
+    bridgeRefreshInFlight = false;
+  }
+}
+
+function scheduleBridgePolling(): void {
+  if (bridgeRefreshTimer !== null) {
+    return;
+  }
+
+  bridgeRefreshTimer = globalThis.setInterval(() => {
+    void refreshBridgeStatus();
+  }, BRIDGE_POLL_INTERVAL_MS);
+}
+
+async function refreshSemanticStatus(): Promise<void> {
+  if (semanticRefreshInFlight) {
+    return;
+  }
+
+  semanticRefreshInFlight = true;
+  try {
+    state.semantic = await refreshSemanticState();
+    commit();
+  } finally {
+    semanticRefreshInFlight = false;
+  }
+}
+
+function scheduleSemanticPolling(): void {
+  if (semanticRefreshTimer !== null) {
+    return;
+  }
+
+  semanticRefreshTimer = globalThis.setInterval(() => {
+    void refreshSemanticStatus();
+  }, SEMANTIC_POLL_INTERVAL_MS);
+}
+
+async function resolveSemanticTarget(tabId: number, selector: string): Promise<{ elementId: string; label: string } | null> {
+  try {
+    const response = await sendContentRequest(tabId, { kind: "resolve-selector", selector });
+    if (response.kind !== "resolve-selector-result" || !response.elementId) {
+      return null;
+    }
+
+    return {
+      elementId: response.elementId,
+      label: response.label || response.tagName || selector,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function mergeSemanticSuggestions(tabId: number, snapshot: PageSnapshot): Promise<void> {
+  const observation = await requestSemanticObservation(snapshot);
+  state.semantic = updateSemanticStateWithObservation(state.semantic, observation);
+
+  if (observation.status !== "ready" || observation.actions.length === 0) {
+    commit();
+    return;
+  }
+
+  const semanticSuggestions = await buildSemanticSuggestions(observation, snapshot, async (selector) => resolveSemanticTarget(tabId, selector));
+  if (semanticSuggestions.length === 0) {
+    commit();
+    return;
+  }
+
+  const mergedSnapshot = {
+    ...snapshot,
+    suggestedActions: [...snapshot.suggestedActions, ...semanticSuggestions],
+  };
+
+  replaceTabState(tabId, (current) => ({
+    ...current,
+    snapshot: mergedSnapshot,
+    pageState: resolvePageStateFromSnapshot(mergedSnapshot),
+    snapshotFresh: true,
+    lastSeenAt: nowIso(),
+  }));
+
+  state.semantic = {
+    ...state.semantic,
+    observedAt: observation.observedAt,
+    pageUrl: observation.pageUrl,
+    pageTitle: observation.pageTitle,
+    suggestionCount: semanticSuggestions.length,
+  };
+
+  pushLog(tabId, "success", "Added semantic suggestions from Stagehand.", `${semanticSuggestions.length} suggestion${semanticSuggestions.length === 1 ? "" : "s"} added.`);
+  commit({ kind: "page-snapshot", tabId, snapshot: mergedSnapshot });
+}
+
+function mergeWorkflowSuggestions(tabId: number, snapshot: PageSnapshot): void {
+  const workflowSuggestions = buildWorkflowSuggestions(state.workflow, snapshot);
+  if (workflowSuggestions.length === 0) {
+    return;
+  }
+
+  const tabState = getTabState(tabId);
+  const currentSnapshot = tabState.snapshot ?? snapshot;
+  const mergedSnapshot = {
+    ...currentSnapshot,
+    suggestedActions: [...workflowSuggestions, ...currentSnapshot.suggestedActions],
+  };
+
+  replaceTabState(tabId, (current) => ({
+    ...current,
+    snapshot: mergedSnapshot,
+    pageState: resolvePageStateFromSnapshot(mergedSnapshot),
+    snapshotFresh: true,
+    lastSeenAt: nowIso(),
+  }));
+
+  commit({ kind: "page-snapshot", tabId, snapshot: mergedSnapshot });
+}
+
 function setLastError(tabId: number, error: ReturnType<typeof normalizeError> | null): void {
   replaceTabState(tabId, (current) => ({
     ...current,
@@ -289,11 +452,12 @@ function setActiveTab(tabId: number | null): void {
   }
 }
 
-function updateTabContextFromChromeTab(tab: chrome.tabs.Tab): TrackedTabState {
+function updateTabContextFromChromeTab(tab: chrome.tabs.Tab, options: UpdateTabContextOptions = {}): TrackedTabState {
   if (typeof tab.id !== "number") {
     throw new Error("Tab is missing an id.");
   }
 
+  const markActive = options.markActive ?? true;
   const current = getTabState(tab.id);
   const nextUrl = tab.url ?? current.url;
   const nextTitle = tab.title ?? current.title;
@@ -303,7 +467,7 @@ function updateTabContextFromChromeTab(tab: chrome.tabs.Tab): TrackedTabState {
   const next = {
     ...current,
     windowId: tab.windowId ?? current.windowId,
-    active: Boolean(tab.active) || state.activeTabId === tab.id,
+    active: markActive ? Boolean(tab.active) || state.activeTabId === tab.id : state.activeTabId === tab.id,
     url: nextUrl,
     title: nextTitle,
     pageState: current.pageState
@@ -319,11 +483,11 @@ function updateTabContextFromChromeTab(tab: chrome.tabs.Tab): TrackedTabState {
   };
 
   state.tabs[tab.id] = next;
-  if (tab.active) {
+  if (markActive && tab.active) {
     setActiveTab(tab.id);
   }
 
-  if (urlChanged || titleChanged) {
+  if ((urlChanged || titleChanged) && options.logChanges !== false) {
     pushLog(tab.id, "info", "Tab context updated.", `${nextTitle || "Untitled"} | ${nextUrl || "unknown url"}`);
   }
 
@@ -341,6 +505,64 @@ async function syncActiveTab(tabId: number): Promise<TrackedTabState | null> {
     const normalized = normalizeError(error, "TAB_SYNC_FAILED", { tabId, recoverable: true });
     setLastError(tabId, normalized);
     pushLog(tabId, "error", "Failed to sync active tab.", normalized.message);
+    commit({ kind: "error", error: normalized });
+    return null;
+  }
+}
+
+async function refreshKnownTabs(): Promise<void> {
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs) {
+      if (typeof tab.id !== "number") {
+        continue;
+      }
+
+      updateTabContextFromChromeTab(tab, { markActive: false, logChanges: false });
+    }
+
+    const activeTabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    const activeTab = activeTabs.find((tab): tab is chrome.tabs.Tab & { id: number } => typeof tab.id === "number") ?? null;
+    if (activeTab) {
+      updateTabContextFromChromeTab(activeTab, { markActive: true, logChanges: false });
+    } else if (state.activeTabId !== null && !state.tabs[state.activeTabId]) {
+      state.activeTabId = null;
+    }
+
+    commit();
+  } catch (error) {
+    const normalized = normalizeError(error, "TAB_REFRESH_FAILED", { recoverable: true });
+    const tabId = state.activeTabId ?? null;
+    if (tabId !== null) {
+      setLastError(tabId, normalized);
+      pushLog(tabId, "error", "Failed to refresh tab inventory.", normalized.message);
+    }
+    commit({ kind: "error", error: normalized });
+  }
+}
+
+async function focusTrackedTab(tabId: number): Promise<TrackedTabState | null> {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (typeof tab.windowId === "number") {
+      try {
+        await chrome.windows.update(tab.windowId, { focused: true });
+      } catch {
+        // The window may already be focused or unavailable; continue to tab activation.
+      }
+    }
+
+    await chrome.tabs.update(tabId, { active: true });
+    const synced = await syncActiveTab(tabId);
+    if (synced) {
+      pushLog(tabId, "info", "Focused tab.", summarizeTrackedTab(synced));
+    }
+
+    return synced;
+  } catch (error) {
+    const normalized = normalizeError(error, "TAB_FOCUS_FAILED", { tabId, recoverable: true });
+    setLastError(tabId, normalized);
+    pushLog(tabId, "error", "Failed to focus tab.", normalized.message);
     commit({ kind: "error", error: normalized });
     return null;
   }
@@ -427,12 +649,16 @@ async function recordSnapshot(tabId: number, mode: ScanMode): Promise<PageSnapsh
     lastError: null,
     lastSeenAt: nowIso(),
   }));
+  state.workflow = recordWorkflowPageState(state.workflow, tabId, pageState, snapshot);
   pushLog(tabId, "success", `Captured ${mode} page snapshot.`, `Interactive controls: ${snapshot.interactiveElements.length}`);
   commit({ kind: "page-snapshot", tabId, snapshot });
   return snapshot;
 }
 
-async function scanActiveTab(mode: ScanMode): Promise<void> {
+async function scanActiveTab(
+  mode: ScanMode,
+  workflowContext: { workflowId?: string; workflowStepId?: string } | null = null,
+): Promise<void> {
   const tabId = state.activeTabId;
   if (tabId === null) {
     const error = normalizeError("No active tab is available.", "NO_ACTIVE_TAB", { recoverable: true });
@@ -456,9 +682,22 @@ async function scanActiveTab(mode: ScanMode): Promise<void> {
   commit();
 
   try {
-    await recordSnapshot(tabId, mode);
+    const snapshot = await recordSnapshot(tabId, mode);
+    if (workflowContext?.workflowId && workflowContext.workflowStepId) {
+      state.workflow = markWorkflowRequestCompleted(state.workflow, workflowContext, snapshot.summary);
+      commit();
+    }
+    if (mode === "suggestions" && state.semantic.status === "ready") {
+      await mergeSemanticSuggestions(tabId, snapshot);
+    }
+    if (mode === "suggestions") {
+      mergeWorkflowSuggestions(tabId, snapshot);
+    }
   } catch (error) {
     const normalized = normalizeError(error, "CAPTURE_FAILED", { tabId, recoverable: true });
+    if (workflowContext?.workflowId && workflowContext.workflowStepId) {
+      state.workflow = markWorkflowRequestFailed(state.workflow, workflowContext, normalized.message);
+    }
     setLastError(tabId, normalized);
     markContentReady(tabId, false);
     pushLog(tabId, "error", "Failed to capture the page.", `${normalized.message}${normalized.details ? ` | ${normalized.details}` : ""}`);
@@ -467,6 +706,35 @@ async function scanActiveTab(mode: ScanMode): Promise<void> {
     markBusy(tabId, false);
     commit();
   }
+}
+
+async function scanTrackedTab(
+  tabId: number,
+  mode: ScanMode,
+  workflowContext: { workflowId?: string; workflowStepId?: string } | null = null,
+): Promise<void> {
+  const tabState = getTabState(tabId);
+  if (!isInspectableUrl(tabState.url)) {
+    const error = normalizeError(`The tab cannot be inspected: ${tabState.url || "unknown url"}`, "UNSUPPORTED_URL", {
+      tabId,
+      recoverable: true,
+    });
+    setLastError(tabId, error);
+    pushLog(tabId, "warning", "Scan blocked because the selected tab is not inspectable.", error.message);
+    commit({ kind: "error", error });
+    return;
+  }
+
+  if (state.activeTabId !== tabId) {
+    const focused = await focusTrackedTab(tabId);
+    if (!focused) {
+      return;
+    }
+  } else {
+    await syncActiveTab(tabId);
+  }
+
+  await scanActiveTab(mode, workflowContext);
 }
 
 function pruneApprovals(approvals: ApprovalRequest[]): ApprovalRequest[] {
@@ -485,6 +753,7 @@ async function queueActionForApproval(action: ActionRequest): Promise<void> {
   const snapshot = tabState.snapshot;
 
   if (isBlockedSensitiveAction(action, snapshot)) {
+    state.workflow = markWorkflowStepFailed(state.workflow, action, "Sensitive fields are not supported in v1.");
     const error = normalizeError("Sensitive form fields are not supported in v1.", "SENSITIVE_FIELD_BLOCKED", {
       tabId,
       recoverable: true,
@@ -495,6 +764,7 @@ async function queueActionForApproval(action: ActionRequest): Promise<void> {
     return;
   }
 
+  state.workflow = markWorkflowStepQueued(state.workflow, action);
   action.tabId = tabId;
   const approval = buildApprovalRequest(action, tabId, snapshot);
   replaceTabState(tabId, (current) => ({
@@ -557,11 +827,13 @@ async function executeApprovedAction(tabId: number, action: ActionRequest, appro
         lastSeenAt: nowIso(),
       };
     });
+    state.workflow = markWorkflowStepCompleted(state.workflow, action, result.message);
 
     pushLog(tabId, "success", `Executed ${actionLabel}.`, result.message);
     commit({ kind: "action-result", result });
   } catch (error) {
     const normalized = normalizeError(error, "ACTION_FAILED", { tabId, recoverable: true });
+    state.workflow = markWorkflowStepFailed(state.workflow, action, normalized.message);
     setLastError(tabId, normalized);
     replaceTabState(tabId, (current) => ({
       ...current,
@@ -632,6 +904,8 @@ async function rejectAction(approvalId: string): Promise<void> {
     updatedAt: nowIso(),
   };
 
+  state.workflow = markWorkflowStepFailed(state.workflow, approval.action, "Rejected by user.");
+
   replaceTabState(tabId, (current) => ({
     ...current,
     approvals: current.approvals.map((entry) => (entry.approvalId === approvalId ? updated : entry)),
@@ -676,28 +950,99 @@ function clearActiveTabLog(): void {
 async function handleUiRequest(port: chrome.runtime.Port, request: UiRequest): Promise<void> {
   switch (request.kind) {
     case "get-state":
+      await refreshKnownTabs();
       port.postMessage({ kind: "state", state } satisfies UiEvent);
+      void refreshBridgeStatus();
+      void refreshSemanticStatus();
       return;
     case "scan-page":
-      await scanActiveTab(request.mode);
+      await scanActiveTab(
+        request.mode,
+        request.workflowId || request.workflowStepId
+          ? {
+              ...(request.workflowId ? { workflowId: request.workflowId } : {}),
+              ...(request.workflowStepId ? { workflowStepId: request.workflowStepId } : {}),
+            }
+          : null,
+      );
       return;
     case "list-interactive-elements":
-      await scanActiveTab("interactive");
+      await scanActiveTab(
+        "interactive",
+        request.workflowId || request.workflowStepId
+          ? {
+              ...(request.workflowId ? { workflowId: request.workflowId } : {}),
+              ...(request.workflowStepId ? { workflowStepId: request.workflowStepId } : {}),
+            }
+          : null,
+      );
       return;
     case "summarize-page":
-      await scanActiveTab("summary");
+      await scanActiveTab(
+        "summary",
+        request.workflowId || request.workflowStepId
+          ? {
+              ...(request.workflowId ? { workflowId: request.workflowId } : {}),
+              ...(request.workflowStepId ? { workflowStepId: request.workflowStepId } : {}),
+            }
+          : null,
+      );
       return;
     case "suggest-next-actions":
-      await scanActiveTab("suggestions");
+      await scanActiveTab(
+        "suggestions",
+        request.workflowId || request.workflowStepId
+          ? {
+              ...(request.workflowId ? { workflowId: request.workflowId } : {}),
+              ...(request.workflowStepId ? { workflowStepId: request.workflowStepId } : {}),
+            }
+          : null,
+      );
       return;
     case "request-action":
       await queueActionForApproval(request.action);
+      return;
+    case "plan-workflow":
+      state.workflow = recordWorkflowPlan(state.workflow, request.workflow, getActiveTabState()?.snapshot ?? null);
+      if (state.activeTabId !== null) {
+        pushLog(
+          state.activeTabId,
+          "info",
+          "Planned a workflow.",
+          `${request.workflow.steps.length} step${request.workflow.steps.length === 1 ? "" : "s"} · ${request.workflow.objective}`,
+        );
+      }
+      commit();
+      return;
+    case "refresh-tabs":
+      await refreshKnownTabs();
+      return;
+    case "focus-tab":
+      await focusTrackedTab(request.tabId);
+      return;
+    case "scan-tab":
+      await scanTrackedTab(
+        request.tabId,
+        request.mode,
+        request.workflowId || request.workflowStepId
+          ? {
+              ...(request.workflowId ? { workflowId: request.workflowId } : {}),
+              ...(request.workflowStepId ? { workflowStepId: request.workflowStepId } : {}),
+            }
+          : null,
+      );
       return;
     case "approve-action":
       await approveAction(request.approvalId);
       return;
     case "reject-action":
       await rejectAction(request.approvalId);
+      return;
+    case "refresh-bridge":
+      await refreshBridgeStatus();
+      return;
+    case "refresh-semantic":
+      await refreshSemanticStatus();
       return;
     case "open-sidepanel":
       await openSidePanel();
@@ -741,6 +1086,7 @@ async function handleContentEvent(message: unknown, sender: chrome.runtime.Messa
         lastError: null,
         lastSeenAt: nowIso(),
       }));
+      state.workflow = recordWorkflowPageState(state.workflow, tabId, nextState, null);
       commit();
       return;
     }
@@ -772,6 +1118,10 @@ chrome.runtime.onConnect.addListener((port) => {
 
   uiPorts.add(port);
   port.postMessage({ kind: "state", state } satisfies UiEvent);
+  void refreshBridgeStatus();
+  void refreshSemanticStatus();
+  scheduleBridgePolling();
+  scheduleSemanticPolling();
   port.onMessage.addListener((message: unknown) => {
     if (!isUiRequest(message)) {
       return;
@@ -784,6 +1134,14 @@ chrome.runtime.onConnect.addListener((port) => {
   });
   port.onDisconnect.addListener(() => {
     uiPorts.delete(port);
+    if (uiPorts.size === 0 && bridgeRefreshTimer !== null) {
+      clearInterval(bridgeRefreshTimer);
+      bridgeRefreshTimer = null;
+    }
+    if (uiPorts.size === 0 && semanticRefreshTimer !== null) {
+      clearInterval(semanticRefreshTimer);
+      semanticRefreshTimer = null;
+    }
   });
 });
 
@@ -805,6 +1163,15 @@ chrome.runtime.onMessage.addListener((message: unknown, sender) => {
 
 chrome.tabs.onActivated.addListener(({ tabId }) => {
   void syncActiveTab(tabId);
+});
+
+chrome.tabs.onCreated.addListener((tab) => {
+  if (typeof tab.id !== "number") {
+    return;
+  }
+
+  updateTabContextFromChromeTab(tab, { markActive: false, logChanges: false });
+  commit();
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
@@ -846,15 +1213,26 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   delete state.tabs[tabId];
-  if (state.activeTabId === tabId) {
+  const wasActive = state.activeTabId === tabId;
+  if (wasActive) {
     state.activeTabId = null;
   }
   commit();
+  if (wasActive) {
+    void refreshKnownTabs();
+  }
 });
 
 chrome.runtime.onInstalled.addListener(() => {
   void persistState();
+  void refreshKnownTabs();
+  void refreshBridgeStatus();
+  void refreshSemanticStatus();
   updateBadge();
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  void refreshKnownTabs();
 });
 
 chrome.action.setBadgeText({ text: "" }).catch(() => undefined);

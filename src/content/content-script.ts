@@ -1,5 +1,5 @@
 import { PAGE_MUTATION_DEBOUNCE_MS } from "../shared/constants";
-import { createActionResult, createSnapshotForMode, getActionScrollAmount, isSensitiveElement } from "../shared/dom";
+import { createActionResult, createSnapshotForMode, getActionScrollAmount, getElementTextSnapshot, isSensitiveElement } from "../shared/dom";
 import { normalizeError, nowIso } from "../shared/logger";
 import { isContentRequest } from "../shared/messages";
 import type { ActionRequest, NavigationMode, PageSnapshot, PageStateBasic } from "../shared/types";
@@ -61,6 +61,8 @@ async function broadcastPageState(reason: "initial" | "mutation" | "navigation" 
     formCount: pageState.meta.formCount,
     visibleTextLength: pageState.meta.visibleTextLength,
     hasSensitiveInputs: pageState.meta.hasSensitiveInputs,
+    siteAdapterId: pageState.siteAdapter?.id ?? null,
+    siteAdapterLabel: pageState.siteAdapter?.label ?? null,
     updatedAt: nowIso(),
   };
 
@@ -151,6 +153,108 @@ function resolveRegistryElement(elementId: string): HTMLElement | null {
   return runtimeState.registry.get(elementId) ?? null;
 }
 
+function registerResolvedElement(element: HTMLElement): string {
+  for (const [elementId, registeredElement] of runtimeState.registry.entries()) {
+    if (registeredElement === element) {
+      return elementId;
+    }
+  }
+
+  const elementId = makeId("element");
+  runtimeState.registry.set(elementId, element);
+  return elementId;
+}
+
+function resolveSelectorWithXPath(selector: string): HTMLElement | null {
+  const normalized = selector.trim().replace(/^xpath=/i, "");
+  if (!normalized) {
+    return null;
+  }
+
+  try {
+    const result = document.evaluate(normalized, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+    return result.singleNodeValue instanceof HTMLElement ? result.singleNodeValue : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveSelectorByText(selector: string): HTMLElement | null {
+  const comparable = normalizeComparable(selector.replace(/^text=/i, "").replace(/^aria=/i, ""));
+  if (!comparable) {
+    return null;
+  }
+
+  const candidates = Array.from(runtimeState.registry.values()).filter((element) => element instanceof HTMLElement);
+  for (const element of candidates) {
+    const label = normalizeComparable(
+      `${element.getAttribute("aria-label") ?? ""} ${element.getAttribute("title") ?? ""} ${getElementTextSnapshot(element)}`,
+    );
+    if (label.includes(comparable)) {
+      return element;
+    }
+  }
+
+  return null;
+}
+
+function resolveSelectorToElement(selector: string): HTMLElement | null {
+  const normalized = selector.trim();
+  if (!normalized) {
+    return null;
+  }
+
+  for (const element of runtimeState.registry.values()) {
+    if (!(element instanceof HTMLElement)) {
+      continue;
+    }
+
+    try {
+      if (element.matches(normalized)) {
+        return element;
+      }
+    } catch {
+      // Fall through to broader matching strategies.
+    }
+  }
+
+  try {
+    const cssMatch = document.querySelector(normalized);
+    if (cssMatch instanceof HTMLElement) {
+      return cssMatch;
+    }
+  } catch {
+    // Ignore invalid CSS selectors.
+  }
+
+  if (normalized.startsWith("xpath=") || normalized.startsWith("/")) {
+    const xpathMatch = resolveSelectorWithXPath(normalized);
+    if (xpathMatch) {
+      return xpathMatch;
+    }
+  }
+
+  const textMatch = resolveSelectorByText(normalized);
+  if (textMatch) {
+    return textMatch;
+  }
+
+  return null;
+}
+
+function resolveActionTarget(action: ActionRequest): HTMLElement | null {
+  const targetById = "elementId" in action ? resolveRegistryElement(action.elementId) : null;
+  if (targetById) {
+    return targetById;
+  }
+
+  if ("selector" in action && action.selector) {
+    return resolveSelectorToElement(action.selector);
+  }
+
+  return null;
+}
+
 function isEditableContent(element: HTMLElement): element is HTMLInputElement | HTMLTextAreaElement | HTMLElement {
   return element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element.isContentEditable;
 }
@@ -160,7 +264,7 @@ async function performAction(action: ActionRequest) {
 
   switch (action.kind) {
     case "click": {
-      const target = resolveRegistryElement(action.elementId);
+      const target = resolveActionTarget(action);
       if (!target) {
         throw new Error(`The target element "${action.elementId}" is no longer available.`);
       }
@@ -169,13 +273,14 @@ async function performAction(action: ActionRequest) {
         throw new Error("Sensitive fields are blocked.");
       }
 
+      registerResolvedElement(target);
       target.focus?.();
       target.click();
       schedulePageStateBroadcast("mutation");
       return createActionResult(action, action.tabId, true, "Clicked the selected element.", `Target: ${target.tagName.toLowerCase()}.`);
     }
     case "type": {
-      const target = resolveRegistryElement(action.elementId);
+      const target = resolveActionTarget(action);
       if (!target || !(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target.isContentEditable)) {
         throw new Error(`The target input "${action.elementId}" is no longer available.`);
       }
@@ -184,6 +289,7 @@ async function performAction(action: ActionRequest) {
         throw new Error("Sensitive fields are blocked.");
       }
 
+      registerResolvedElement(target);
       if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
         target.focus();
         const nextValue = action.clearBeforeTyping === false ? `${getFieldValue(target)}${action.text}` : action.text;
@@ -205,11 +311,12 @@ async function performAction(action: ActionRequest) {
       return createActionResult(action, action.tabId, true, "Typed text into the selected field.", `Inserted ${action.text.length} characters.`);
     }
     case "select": {
-      const target = resolveRegistryElement(action.elementId);
+      const target = resolveActionTarget(action);
       if (!target || !(target instanceof HTMLSelectElement)) {
         throw new Error(`The target dropdown "${action.elementId}" is no longer available.`);
       }
 
+      registerResolvedElement(target);
       const selectedLabel = selectOption(target, action);
       schedulePageStateBroadcast("mutation");
       return createActionResult(action, action.tabId, true, "Selected a dropdown option.", `Selected ${selectedLabel}.`);
@@ -238,11 +345,12 @@ async function performAction(action: ActionRequest) {
       return createActionResult(action, action.tabId, true, "Reloaded the current page.", `Started at ${startedAt}.`);
     }
     case "submit-form": {
-      const target = resolveRegistryElement(action.elementId);
+      const target = resolveActionTarget(action);
       if (!target) {
         throw new Error(`The target form "${action.elementId}" is no longer available.`);
       }
 
+      registerResolvedElement(target);
       const form = target instanceof HTMLFormElement ? target : target.closest("form");
       if (!form) {
         throw new Error("No form was found for the selected target.");
@@ -311,6 +419,18 @@ function bootstrap(): void {
           sendResponse({
             kind: "page-snapshot",
             snapshot: capture.snapshot,
+          });
+          return;
+        }
+        case "resolve-selector": {
+          const target = resolveSelectorToElement(message.selector);
+          const elementId = target ? registerResolvedElement(target) : null;
+          sendResponse({
+            kind: "resolve-selector-result",
+            selector: message.selector,
+            elementId,
+            tagName: target?.tagName.toLowerCase() ?? null,
+            label: target ? getElementTextSnapshot(target) || target.getAttribute("aria-label") || target.getAttribute("title") || target.tagName.toLowerCase() : null,
           });
           return;
         }

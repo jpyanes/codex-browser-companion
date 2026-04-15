@@ -1,5 +1,6 @@
 import { DEFAULT_SCROLL_AMOUNT, MAX_FORM_FIELDS, MAX_HEADINGS, MAX_INTERACTIVE_ELEMENTS, MAX_LINKS, MAX_VISIBLE_TEXT_CHARS } from "./constants";
 import { nowIso } from "./logger";
+import { resolveSiteAdapterFromState, resolveSiteAdapterSnapshot } from "./site-adapters";
 import type {
   ActionRequest,
   BoxRect,
@@ -15,6 +16,7 @@ import type {
   PageStateBasic,
   ScanMode,
   SemanticNode,
+  SiteAdapterSummary,
   SuggestedAction,
   SuggestedRequest,
 } from "./types";
@@ -527,12 +529,25 @@ function derivePageKind(state: PageStateBasic, headings: HeadingSummary[], forms
   return "document";
 }
 
-function summarizePageState(state: PageStateBasic, headings: HeadingSummary[], forms: FormSummary[], interactiveCount: number): string {
+function summarizePageState(
+  state: PageStateBasic,
+  headings: HeadingSummary[],
+  forms: FormSummary[],
+  interactiveCount: number,
+  siteAdapter: SiteAdapterSummary | null,
+): string {
   const kindLabel = state.pageKind === "unknown" ? "page" : `${state.pageKind} page`;
   const parts = [
     `${state.title || "Untitled"} on ${new URL(state.url).hostname}.`,
     `This is a ${kindLabel} with ${headings.length} heading${headings.length === 1 ? "" : "s"}, ${forms.length} form${forms.length === 1 ? "" : "s"}, and ${interactiveCount} interactive control${interactiveCount === 1 ? "" : "s"}.`,
   ];
+
+  if (siteAdapter) {
+    parts.push(siteAdapter.summary);
+    if (siteAdapter.notes.length > 0) {
+      parts.push(siteAdapter.notes[0]!);
+    }
+  }
 
   if (state.hasSensitiveInputs) {
     parts.push("Sensitive inputs are present. Password values are not captured and the extension will not type into them.");
@@ -555,6 +570,9 @@ function buildSuggestedActions(snapshot: PageSnapshot): SuggestedAction[] {
       request: { kind: "scan-page", mode: "summary" },
       approvalRequired: false,
       dangerLevel: "low",
+      source: "dom",
+      selector: undefined,
+      confidence: undefined,
     },
     {
       id: "list-interactive-elements",
@@ -564,6 +582,9 @@ function buildSuggestedActions(snapshot: PageSnapshot): SuggestedAction[] {
       request: { kind: "scan-page", mode: "interactive" },
       approvalRequired: false,
       dangerLevel: "low",
+      source: "dom",
+      selector: undefined,
+      confidence: undefined,
     },
   ];
 
@@ -576,6 +597,9 @@ function buildSuggestedActions(snapshot: PageSnapshot): SuggestedAction[] {
       request: { kind: "scan-page", mode: "summary" },
       approvalRequired: false,
       dangerLevel: "low",
+      source: "dom",
+      selector: undefined,
+      confidence: undefined,
     });
   }
 
@@ -588,6 +612,9 @@ function buildSuggestedActions(snapshot: PageSnapshot): SuggestedAction[] {
       request: { kind: "scan-page", mode: "interactive" },
       approvalRequired: false,
       dangerLevel: "low",
+      source: "dom",
+      selector: undefined,
+      confidence: undefined,
     });
   }
 
@@ -600,6 +627,9 @@ function buildSuggestedActions(snapshot: PageSnapshot): SuggestedAction[] {
       request: { kind: "scan-page", mode: "full" },
       approvalRequired: false,
       dangerLevel: "low",
+      source: "dom",
+      selector: undefined,
+      confidence: undefined,
     });
   }
 
@@ -623,12 +653,18 @@ export function capturePageState(document: Document, navigationMode: NavigationM
     formCount: forms.length,
     visibleTextLength: visibleText.length,
     hasSensitiveInputs,
+    siteAdapterId: null,
+    siteAdapterLabel: null,
     updatedAt: toIso(),
   };
+
+  const siteAdapter = resolveSiteAdapterFromState(provisionalState);
 
   return {
     ...provisionalState,
     pageKind: derivePageKind(provisionalState, headings, forms),
+    siteAdapterId: siteAdapter?.id ?? null,
+    siteAdapterLabel: siteAdapter?.label ?? null,
   };
 }
 
@@ -649,12 +685,48 @@ export function capturePageSnapshot(document: Document, options: SnapshotCapture
     formCount: forms.length,
     visibleTextLength: visibleText.length,
     hasSensitiveInputs: forms.some((form) => form.hasPasswordField || form.hasFileField),
+    siteAdapterId: null,
+    siteAdapterLabel: null,
     updatedAt: toIso(),
   };
 
   const pageKind = derivePageKind(pageState, headings, forms);
   const completedState = { ...pageState, pageKind };
   const semanticOutline = captureSemanticOutline(document, headings);
+  const siteResolution = resolveSiteAdapterSnapshot({
+    snapshotId: "",
+    tabId: -1,
+    url: document.location.href,
+    title: completedState.title,
+    captureMode: options.mode,
+    capturedAt: toIso(),
+    pageKind,
+    navigationMode: options.navigationMode,
+    visibleText,
+    visibleTextExcerpt: "",
+    textLength: visibleText.length,
+    meta: {
+      navigationMode: options.navigationMode,
+      readyState: document.readyState,
+      interactiveCount: interactiveElements.length,
+      linkCount: links.length,
+      formCount: forms.length,
+      headingCount: headings.length,
+      visibleTextLength: visibleText.length,
+      hasSensitiveInputs: completedState.hasSensitiveInputs,
+      isArticleLike: pageKind === "article",
+      isLoginLike: pageKind === "login",
+      isSinglePageApp: options.navigationMode === "spa",
+    },
+    headings,
+    links,
+    forms,
+    interactiveElements,
+    semanticOutline,
+    siteAdapter: null,
+    suggestedActions: [],
+    summary: "",
+  });
   const snapshotBase: Omit<PageSnapshot, "summary" | "suggestedActions"> = {
     snapshotId: globalThis.crypto?.randomUUID?.() ?? `snapshot_${Date.now()}_${Math.random().toString(16).slice(2)}`,
     tabId: -1,
@@ -685,19 +757,21 @@ export function capturePageSnapshot(document: Document, options: SnapshotCapture
     forms,
     interactiveElements,
     semanticOutline,
+    siteAdapter: siteResolution.siteAdapter,
   };
 
   const snapshot: PageSnapshot = {
     ...snapshotBase,
-    summary: summarizePageState(completedState, headings, forms, interactiveElements.length),
+    summary: summarizePageState(completedState, headings, forms, interactiveElements.length, siteResolution.siteAdapter),
     suggestedActions: buildSuggestedActions({
       ...snapshotBase,
+      siteAdapter: siteResolution.siteAdapter,
       summary: "",
       suggestedActions: [],
     }),
   };
 
-  snapshot.suggestedActions = buildSuggestedActions(snapshot);
+  snapshot.suggestedActions = [...snapshot.suggestedActions, ...siteResolution.suggestions];
 
   return { snapshot, registry: registry.registry };
 }
@@ -716,7 +790,8 @@ export function createActionResult(action: ActionRequest, tabId: number, success
 }
 
 export function buildPageStateSummary(pageState: PageStateBasic): string {
-  return `${pageState.title || "Untitled"} on ${new URL(pageState.url).hostname}. ${pageState.pageKind} page with ${pageState.interactiveCount} interactive controls and ${pageState.formCount} forms.`;
+  const adapterLabel = pageState.siteAdapterLabel ? ` ${pageState.siteAdapterLabel} detected.` : "";
+  return `${pageState.title || "Untitled"} on ${new URL(pageState.url).hostname}.${adapterLabel} ${pageState.pageKind} page with ${pageState.interactiveCount} interactive controls and ${pageState.formCount} forms.`;
 }
 
 export function getActionScrollAmount(action: ActionRequest): number {
@@ -746,6 +821,8 @@ export function resolvePageStateFromSnapshot(snapshot: PageSnapshot): PageStateB
     formCount: snapshot.meta.formCount,
     visibleTextLength: snapshot.meta.visibleTextLength,
     hasSensitiveInputs: snapshot.meta.hasSensitiveInputs,
+    siteAdapterId: snapshot.siteAdapter?.id ?? null,
+    siteAdapterLabel: snapshot.siteAdapter?.label ?? null,
     updatedAt: snapshot.capturedAt,
   };
 }

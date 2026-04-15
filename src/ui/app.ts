@@ -1,12 +1,28 @@
 import { DEFAULT_UI_POLL_MS } from "../shared/constants";
-import { parseInstruction } from "../shared/instructions";
+import { bridgeStatusLabel, bridgeStatusTone, summarizeBridgeState } from "../shared/bridge";
 import { normalizeError, nowIso } from "../shared/logger";
+import { semanticStatusLabel, semanticStatusTone, summarizeSemanticState } from "../shared/semantic";
+import { sortTrackedTabs, summarizeTrackedTab, tabStatusLabel, tabStatusTone } from "../shared/tab-orchestration";
+import { searchTrackedTabs } from "../shared/tab-intelligence";
+import {
+  buildWorkflowPlanFromInstruction,
+  getActiveWorkflowNextStep,
+  summarizeWorkflowState,
+  workflowProgress,
+  workflowStatusLabel,
+  workflowStatusTone,
+  workflowStepStatusLabel,
+  workflowStepStatusTone,
+} from "../shared/workflow";
 import type {
   ApprovalRequest,
+  BridgeState,
   ExtensionState,
   PageSnapshot,
   SuggestedAction,
   SuggestedRequest,
+  SemanticState,
+  WorkflowState,
   TrackedTabState,
 } from "../shared/types";
 
@@ -120,8 +136,8 @@ function statusClass(status: ExtensionState["status"]): string {
 
 function commandHint(mode: AppMode): string {
   return mode === "popup"
-    ? 'Try: "click save", "type hello into search", "scroll down 600", or "summarize page".'
-    : 'Try: "click save", "type hello into search", "scroll down 600", or "summarize page".';
+    ? 'Try: "click save", "click save then summarize page", "type hello into search", or "scroll down 600".'
+    : 'Try: "click save", "click save then summarize page", "type hello into search", or "scroll down 600".';
 }
 
 function getPageState(tab: TrackedTabState | null): PageSnapshot | null {
@@ -215,13 +231,33 @@ function renderSuggestions(snapshot: PageSnapshot | null): string {
 
 function renderSuggestionCard(suggestion: SuggestedAction): string {
   const tone = suggestion.dangerLevel === "high" ? "danger" : suggestion.dangerLevel === "medium" ? "warning" : "neutral";
+  const sourceLabel =
+    suggestion.source === "workflow"
+      ? "Workflow"
+      : suggestion.source === "stagehand"
+        ? "Stagehand"
+        : suggestion.source === "site"
+          ? "Site"
+          : "DOM";
+  const confidenceLabel = typeof suggestion.confidence === "number" && Number.isFinite(suggestion.confidence)
+    ? `${Math.round(suggestion.confidence * 100)}%`
+    : "";
   return `
     <button class="suggestion" data-suggestion-id="${safeAttr(suggestion.id)}">
       <div class="suggestion__top">
         <div class="suggestion__title">${escapeHtml(suggestion.title)}</div>
-        ${renderChip(suggestion.dangerLevel, tone)}
+        <div class="suggestion__chips">
+          ${renderChip(sourceLabel, "neutral")}
+          ${renderChip(suggestion.dangerLevel, tone)}
+          ${confidenceLabel ? renderChip(confidenceLabel, "neutral") : ""}
+        </div>
       </div>
       <div class="suggestion__description">${escapeHtml(suggestion.description)}</div>
+      ${
+        suggestion.selector
+          ? `<div class="suggestion__selector">${escapeHtml(suggestion.selector)}</div>`
+          : ""
+      }
       <div class="suggestion__cta">${escapeHtml(suggestion.buttonLabel)}</div>
     </button>`;
 }
@@ -285,9 +321,11 @@ function renderSummary(tab: TrackedTabState | null, snapshot: PageSnapshot | nul
   const pageState = tab.pageState;
   const freshState = tab.snapshotFresh ? "Fresh" : "Stale";
   const freshnessTone = tab.snapshotFresh ? "success" : "warning";
+  const adapterLabel = pageState?.siteAdapterLabel || snapshot?.siteAdapter?.label || "";
   const kinds = [
     pageState ? renderChip(pageState.pageKind, "neutral") : "",
     pageState ? renderChip(pageState.navigationMode, "neutral") : "",
+    adapterLabel ? renderChip(adapterLabel, "neutral") : "",
     tab.contentReady ? renderChip("Content ready", "success") : renderChip("No content script", "warning"),
     tab.busy ? renderChip("Busy", "warning") : "",
     tab.lastError ? renderChip("Error present", "danger") : "",
@@ -374,12 +412,343 @@ function renderSummary(tab: TrackedTabState | null, snapshot: PageSnapshot | nul
   `;
 }
 
-function renderPanels(tab: TrackedTabState | null, snapshot: PageSnapshot | null, mode: AppMode): string {
+function renderBridgePanel(bridge: BridgeState | null): string {
+  if (!bridge) {
+    return `<section class="panel panel--bridge"><p class="empty">No bridge state available yet.</p></section>`;
+  }
+
+  const tone = bridgeStatusTone(bridge.status);
+  const label = bridgeStatusLabel(bridge.status);
+  const active = bridge.activeExtension;
+  const activeSummary = active
+    ? `${active.browser || "Chrome"} · ${active.profile?.email || "unknown profile"} · ${bridge.activeTargetCount} active target${bridge.activeTargetCount === 1 ? "" : "s"}`
+    : "No Playwriter-enabled tab detected yet.";
+
+  return `
+    <section class="panel panel--bridge">
+      <div class="section-head">
+        <h2>Live bridge</h2>
+        <span class="section-note">Playwriter relay on localhost</span>
+      </div>
+      <div class="bridge-card">
+        <div class="bridge-card__top">
+          <div>
+            <div class="bridge-card__label">Bridge state</div>
+            <div class="bridge-card__summary">${escapeHtml(summarizeBridgeState(bridge))}</div>
+          </div>
+          <span class="status-chip status-chip--${tone}">${escapeHtml(label)}</span>
+        </div>
+        <div class="bridge-card__meta">
+          <span>Endpoint: ${escapeHtml(bridge.endpoint)}</span>
+          <span>Relay: ${escapeHtml(bridge.relayVersion || "not detected")}</span>
+          <span>${escapeHtml(activeSummary)}</span>
+          <span>Checked: ${bridge.checkedAt ? escapeHtml(formatTime(bridge.checkedAt)) : "unknown"}</span>
+        </div>
+        ${
+          bridge.lastError
+            ? `
+              <div class="bridge-card__error">
+                <div class="bridge-card__error-title">${escapeHtml(bridge.lastError.message)}</div>
+                <div class="bridge-card__error-meta">${escapeHtml(bridge.lastError.code)}</div>
+              </div>`
+            : ""
+        }
+      </div>
+    </section>
+  `;
+}
+
+function renderSemanticPanel(semantic: SemanticState | null): string {
+  if (!semantic) {
+    return `<section class="panel panel--semantic"><p class="empty">No semantic bridge state available yet.</p></section>`;
+  }
+
+  const tone = semanticStatusTone(semantic.status);
+  const label = semanticStatusLabel(semantic.status);
+  return `
+    <section class="panel panel--semantic">
+      <div class="section-head">
+        <h2>Semantic layer</h2>
+        <span class="section-note">Stagehand observe on the live Chrome session</span>
+      </div>
+      <div class="bridge-card">
+        <div class="bridge-card__top">
+          <div>
+            <div class="bridge-card__label">Semantic state</div>
+            <div class="bridge-card__summary">${escapeHtml(summarizeSemanticState(semantic))}</div>
+          </div>
+          <span class="status-chip status-chip--${tone}">${escapeHtml(label)}</span>
+        </div>
+        <div class="bridge-card__meta">
+          <span>Endpoint: ${escapeHtml(semantic.endpoint)}</span>
+          <span>Browser: ${escapeHtml(semantic.browserEndpoint || "not detected")}</span>
+          <span>Model: ${escapeHtml(semantic.model || "not configured")}</span>
+          <span>Suggestions: ${semantic.suggestionCount}</span>
+          <span>Observed: ${semantic.observedAt ? escapeHtml(formatTime(semantic.observedAt)) : "never"}</span>
+        </div>
+        ${
+          semantic.pageTitle || semantic.pageUrl
+            ? `<div class="bridge-card__meta"><span>Page: ${escapeHtml(semantic.pageTitle || semantic.pageUrl || "")}</span></div>`
+            : ""
+        }
+        ${
+          semantic.disabledReason
+            ? `
+              <div class="bridge-card__error">
+                <div class="bridge-card__error-title">${escapeHtml(semantic.disabledReason)}</div>
+                <div class="bridge-card__error-meta">Configure STAGEHAND_MODEL and the matching provider API key, then run npm run semantic.</div>
+              </div>`
+            : ""
+        }
+        ${
+          semantic.lastError
+            ? `
+              <div class="bridge-card__error">
+                <div class="bridge-card__error-title">${escapeHtml(semantic.lastError.message)}</div>
+                <div class="bridge-card__error-meta">${escapeHtml(semantic.lastError.code)}</div>
+              </div>`
+            : ""
+        }
+      </div>
+    </section>
+  `;
+}
+
+function renderTabOrchestrationPanel(tabs: TrackedTabState[], activeTabId: number | null, mode: AppMode, searchQuery: string): string {
+  const sorted = sortTrackedTabs(tabs, activeTabId);
+  const query = searchQuery.trim();
+  const searchResults = searchTrackedTabs(tabs, searchQuery, activeTabId);
+  const visibleResults = limit(searchResults, mode === "popup" ? 5 : 10);
+
+  return `
+    <section class="panel panel--tabs">
+      <div class="section-head">
+        <h2>Tab intelligence</h2>
+        <span class="section-note">MCP-style cross-tab search and focus</span>
+      </div>
+      <div class="tabs-toolbar">
+        <label class="tabs-toolbar__search">
+          <span class="tabs-toolbar__search-label">Search tabs</span>
+          <input
+            class="tabs-toolbar__search-input"
+            data-tab-search
+            type="search"
+            placeholder="Search titles, URLs, summaries, or site adapters"
+            value="${safeAttr(searchQuery)}"
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </label>
+        <button class="btn btn--ghost" data-action="refresh-tabs" type="button">Refresh tabs</button>
+        <span class="section-note">${query ? `${searchResults.length} match${searchResults.length === 1 ? "" : "es"} for "${escapeHtml(query)}"` : `${sorted.length} tracked tab${sorted.length === 1 ? "" : "s"}`}</span>
+      </div>
+      ${
+        visibleResults.length === 0
+          ? `<p class="empty">No tracked tabs matched the current search. Refresh tabs to rebuild the inventory.</p>`
+          : `<ul class="tab-list">${visibleResults
+              .map((result) => {
+                const tab = result.tab;
+                const isCurrent = tab.tabId === activeTabId;
+                const statusTone = tabStatusTone(tab, activeTabId);
+                const statusLabel = tabStatusLabel(tab, activeTabId);
+                const approvals = tab.approvals.filter((approval) => approval.status === "pending" || approval.status === "executing").length;
+                const interactiveCount = tab.pageState?.interactiveCount ?? 0;
+                const adapterLabel = tab.pageState?.siteAdapterLabel || tab.snapshot?.siteAdapter?.label || "";
+
+                return `
+                  <li class="tab-row${isCurrent ? " tab-row--active" : ""}">
+                    <div class="tab-row__top">
+                      <div>
+                        <div class="tab-row__title">${escapeHtml(tab.title || "Untitled page")}</div>
+                        <div class="tab-row__url">${escapeHtml(tab.url || "Unknown url")}</div>
+                      </div>
+                      ${renderChip(statusLabel, statusTone)}
+                    </div>
+                    <div class="tab-row__meta">
+                      <span>${escapeHtml(`Window ${tab.windowId}`)}</span>
+                      <span>${tab.contentReady ? "Content ready" : "No content script"}</span>
+                      <span>${tab.snapshotFresh ? "Snapshot fresh" : "Snapshot stale"}</span>
+                      <span>${approvals > 0 ? `${approvals} approval${approvals === 1 ? "" : "s"}` : "No approvals"}</span>
+                      ${adapterLabel ? `<span>Adapter: ${escapeHtml(adapterLabel)}</span>` : ""}
+                      ${query ? `<span>Match: ${escapeHtml(result.reason)}</span>` : ""}
+                    </div>
+                    <div class="tab-row__summary">${escapeHtml(summarizeTrackedTab(tab))}</div>
+                    <div class="tab-row__footer">
+                      <span>Interactive controls: ${interactiveCount}</span>
+                      <span>Last seen ${escapeHtml(formatRelative(tab.lastSeenAt))}</span>
+                    </div>
+                    <div class="tab-row__actions">
+                      ${
+                        isCurrent
+                          ? `<span class="tab-row__current">Current tab</span>`
+                          : `<button class="btn btn--ghost" data-tab-action="focus" data-tab-id="${safeAttr(String(tab.tabId))}" type="button">Focus</button>`
+                      }
+                      <button class="btn btn--ghost" data-tab-action="scan" data-mode="full" data-tab-id="${safeAttr(String(tab.tabId))}" type="button">Scan</button>
+                      <button class="btn btn--ghost" data-tab-action="scan" data-mode="summary" data-tab-id="${safeAttr(String(tab.tabId))}" type="button">Summary</button>
+                    </div>
+                  </li>`;
+              })
+              .join("")}</ul>`
+      }
+      ${
+        sorted.length > visibleResults.length
+          ? `<p class="section-note">Showing ${visibleResults.length} of ${sorted.length} tracked tabs${query ? " after search filtering" : ""}.</p>`
+          : ""
+      }
+    </section>
+  `;
+}
+
+function renderWorkflowSteps(workflow: WorkflowState | null): string {
+  const active = workflow?.activeWorkflow;
+  if (!active) {
+    return `<p class="empty">No active workflow plan yet. Enter a multi-step command to create one.</p>`;
+  }
+
+  if (active.steps.length === 0) {
+    return `<p class="empty">This workflow does not have any steps yet.</p>`;
+  }
+
+  return `<ol class="workflow-step-list">${active.steps
+    .map((step, index) => {
+      const tone = workflowStepStatusTone(step.status);
+      const badge = workflowStepStatusLabel(step.status);
+      const current = index === active.currentStepIndex ? " workflow-step--current" : "";
+      return `
+        <li class="workflow-step${current}">
+          <div class="workflow-step__header">
+            <div class="workflow-step__title">${escapeHtml(step.title)}</div>
+            ${renderChip(badge, tone)}
+          </div>
+          <div class="workflow-step__description">${escapeHtml(step.description)}</div>
+          ${
+            step.notes
+              ? `<div class="workflow-step__notes">${escapeHtml(step.notes)}</div>`
+              : ""
+          }
+        </li>`;
+    })
+    .join("")}</ol>`;
+}
+
+function renderWorkflowPanel(workflow: WorkflowState | null): string {
+  if (!workflow) {
+    return `<section class="panel panel--workflow"><p class="empty">No workflow memory available yet.</p></section>`;
+  }
+
+  const active = workflow.activeWorkflow;
+  const progress = workflowProgress(workflow);
+  const tone = active ? workflowStatusTone(active.status) : "neutral";
+  const label = active ? workflowStatusLabel(active.status) : "Idle";
+  const nextStep = getActiveWorkflowNextStep(workflow);
+  const nextRequest = nextStep?.request ?? null;
+  const nextSummary = nextStep
+    ? `${nextStep.title}${nextStep.request?.kind === "request-action" ? " (approval queued before execution)" : ""}`
+    : "No active step is ready to continue.";
+  const recent = workflow.recentWorkflows.slice().reverse();
+
+  return `
+    <section class="panel panel--workflow">
+      <div class="section-head">
+        <h2>Workflow memory</h2>
+        <span class="section-note">Planner state and recent outcomes</span>
+      </div>
+      <div class="bridge-card workflow-card">
+        <div class="bridge-card__top">
+          <div>
+            <div class="bridge-card__label">Workflow state</div>
+            <div class="bridge-card__summary">${escapeHtml(summarizeWorkflowState(workflow))}</div>
+          </div>
+          <span class="status-chip status-chip--${tone}">${escapeHtml(label)}</span>
+        </div>
+        <div class="bridge-card__meta">
+          <span>Completed: ${progress.completed}/${progress.total || 0}</span>
+          <span>Blocked: ${progress.blocked}</span>
+          <span>Last instruction: ${escapeHtml(workflow.lastInstruction || "none")}</span>
+          <span>Last objective: ${escapeHtml(workflow.lastObjective || "none")}</span>
+        </div>
+        ${
+          active
+            ? `
+              <div class="workflow-card__focus">
+                <div class="workflow-card__focus-label">Current workflow</div>
+                <div class="workflow-card__focus-title">${escapeHtml(active.objective)}</div>
+                <div class="workflow-card__focus-meta">Step ${Math.min(active.currentStepIndex + 1, active.steps.length || 1)} of ${active.steps.length || 1}</div>
+                <div class="workflow-card__focus-next">${escapeHtml(nextSummary)}</div>
+                ${
+                  active.status === "paused"
+                    ? `<div class="workflow-card__blocked">The current step is blocked or unsupported. Start a new command to replace the workflow, or continue manually if the page changed.</div>`
+                    : ""
+                }
+                ${
+                  nextRequest
+                    ? `<div class="approval-dialog__actions"><button class="btn btn--primary" data-action="continue-workflow" type="button">Continue workflow</button></div>`
+                    : ""
+                }
+              </div>`
+            : ""
+        }
+      </div>
+      <div class="section-split">
+        <div>
+          <h3>Steps</h3>
+          ${renderWorkflowSteps(workflow)}
+        </div>
+        <div>
+          <h3>Memory notes</h3>
+          ${
+            workflow.memoryNotes.length > 0
+              ? `<ul class="workflow-note-list">${workflow.memoryNotes
+                  .slice()
+                  .reverse()
+                  .map((note) => `<li>${escapeHtml(note)}</li>`)
+                  .join("")}</ul>`
+              : `<p class="empty">No workflow notes yet.</p>`
+          }
+          <h3>Recent workflows</h3>
+          ${
+            recent.length > 0
+              ? `<ul class="workflow-history-list">${recent
+                  .map((entry) => `
+                    <li class="workflow-history-item">
+                      <div class="workflow-history-item__top">
+                        <span class="workflow-history-item__title">${escapeHtml(entry.objective)}</span>
+                        ${renderChip(workflowStatusLabel(entry.status), workflowStatusTone(entry.status))}
+                      </div>
+                      <div class="workflow-history-item__meta">
+                        <span>${entry.completedStepCount}/${entry.stepCount} steps</span>
+                        <span>${escapeHtml(entry.originTitle || entry.originUrl || "unknown page")}</span>
+                      </div>
+                    </li>`)
+                  .join("")}</ul>`
+              : `<p class="empty">No recent workflows yet.</p>`
+          }
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderPanels(
+  tab: TrackedTabState | null,
+  snapshot: PageSnapshot | null,
+  bridge: BridgeState | null,
+  semantic: SemanticState | null,
+  workflow: WorkflowState | null,
+  tabs: TrackedTabState[],
+  activeTabId: number | null,
+  tabSearchQuery: string,
+  mode: AppMode,
+): string {
   const maxInteractive = mode === "popup" ? 6 : 14;
   const maxLogs = mode === "popup" ? 6 : 12;
 
   return `
     ${renderSummary(tab, snapshot, mode)}
+    ${renderTabOrchestrationPanel(tabs, activeTabId, mode, tabSearchQuery)}
+    ${renderBridgePanel(bridge)}
+    ${renderSemanticPanel(semantic)}
+    ${renderWorkflowPanel(workflow)}
     <section class="panel">
       <div class="section-head">
         <h2>Suggested next actions</h2>
@@ -437,6 +806,7 @@ export class BrowserCompanionApp {
   private reconnectTimer: number | null = null;
   private currentApproval: ApprovalRequest | null = null;
   private commandFeedback = "";
+  private tabSearchQuery = "";
   private suggestionLookup = new Map<string, SuggestedAction>();
   private readonly rootShell: HTMLElement;
   private readonly stateRoot: HTMLElement;
@@ -507,6 +877,9 @@ export class BrowserCompanionApp {
             <button class="btn btn--ghost" data-action="scan-page" data-mode="interactive" type="button">List interactive</button>
             <button class="btn btn--ghost" data-action="scan-page" data-mode="summary" type="button">Summarize</button>
             <button class="btn btn--ghost" data-action="scan-page" data-mode="suggestions" type="button">Suggest next</button>
+            <button class="btn btn--ghost" data-action="refresh-bridge" type="button">Refresh bridge</button>
+            <button class="btn btn--ghost" data-action="refresh-semantic" type="button">Refresh semantic</button>
+            <button class="btn btn--ghost" data-action="refresh-tabs" type="button">Refresh tabs</button>
             <button class="btn btn--ghost" data-action="open-sidepanel" type="button">Open side panel</button>
             <button class="btn btn--ghost" data-action="clear-log" type="button">Clear log</button>
           </div>
@@ -571,6 +944,24 @@ export class BrowserCompanionApp {
         return;
       }
 
+      const tabActionButton = target.closest<HTMLElement>("[data-tab-action][data-tab-id]");
+      if (tabActionButton) {
+        const tabAction = tabActionButton.dataset.tabAction;
+        const tabId = Number.parseInt(tabActionButton.dataset.tabId ?? "", 10);
+        if (!tabAction || !Number.isFinite(tabId)) {
+          return;
+        }
+
+        event.preventDefault();
+        if (tabAction === "focus") {
+          this.send({ kind: "focus-tab", tabId });
+        } else if (tabAction === "scan") {
+          const mode = (tabActionButton.dataset.mode as "full" | "interactive" | "summary" | "suggestions" | undefined) ?? "full";
+          this.send({ kind: "scan-tab", tabId, mode });
+        }
+        return;
+      }
+
       const quickAction = target.closest<HTMLElement>("[data-action]");
       if (quickAction) {
         const action = quickAction.dataset.action;
@@ -582,11 +973,38 @@ export class BrowserCompanionApp {
         if (action === "scan-page") {
           const mode = (quickAction.dataset.mode as "full" | "interactive" | "summary" | "suggestions" | undefined) ?? "full";
           this.send({ kind: "scan-page", mode });
+        } else if (action === "refresh-bridge") {
+          this.send({ kind: "refresh-bridge" });
+        } else if (action === "refresh-semantic") {
+          this.send({ kind: "refresh-semantic" });
+        } else if (action === "refresh-tabs") {
+          this.send({ kind: "refresh-tabs" });
         } else if (action === "open-sidepanel") {
           this.send({ kind: "open-sidepanel" });
+        } else if (action === "continue-workflow") {
+          const nextStep = getActiveWorkflowNextStep(this.state?.workflow ?? null);
+          if (nextStep?.request) {
+            this.sendSuggestion(nextStep.request);
+            this.setFeedback(`Continuing workflow: ${nextStep.title}`, "info");
+          } else {
+            this.setFeedback("No workflow step is ready to continue yet.", "warning");
+          }
         } else if (action === "clear-log") {
           this.send({ kind: "clear-log" });
         }
+      }
+    });
+
+    this.root.addEventListener("input", (event) => {
+      const target = event.target as HTMLElement | null;
+      if (!target) {
+        return;
+      }
+
+      const tabSearchInput = target.closest<HTMLInputElement>("[data-tab-search]");
+      if (tabSearchInput && tabSearchInput === target) {
+        this.tabSearchQuery = tabSearchInput.value;
+        this.renderState();
       }
     });
 
@@ -685,6 +1103,8 @@ export class BrowserCompanionApp {
               formCount: message.snapshot.meta.formCount,
               visibleTextLength: message.snapshot.meta.visibleTextLength,
               hasSensitiveInputs: message.snapshot.meta.hasSensitiveInputs,
+              siteAdapterId: message.snapshot.siteAdapter?.id ?? null,
+              siteAdapterLabel: message.snapshot.siteAdapter?.label ?? null,
               updatedAt: message.snapshot.capturedAt,
             },
             snapshotFresh: true,
@@ -736,7 +1156,17 @@ export class BrowserCompanionApp {
     this.statusChip.textContent = statusLabel(this.state?.status ?? "idle");
     this.statusSubline.textContent = activeTab ? `${activeTab.title || "Untitled page"}${activeTab.snapshotFresh ? " - snapshot fresh" : " - snapshot stale"}` : "Waiting for a page.";
 
-    this.stateRoot.innerHTML = renderPanels(activeTab, snapshot, this.mode);
+    this.stateRoot.innerHTML = renderPanels(
+      activeTab,
+      snapshot,
+      this.state?.bridge ?? null,
+      this.state?.semantic ?? null,
+      this.state?.workflow ?? null,
+      Object.values(this.state?.tabs ?? {}),
+      this.state?.activeTabId ?? null,
+      this.tabSearchQuery,
+      this.mode,
+    );
     this.suggestionLookup = new Map((snapshot?.suggestedActions ?? []).map((suggestion) => [suggestion.id, suggestion]));
 
     if (this.currentApproval) {
@@ -798,7 +1228,20 @@ export class BrowserCompanionApp {
     }
   }
 
-  private send(request: SuggestedRequest | { kind: "approve-action"; approvalId: string } | { kind: "reject-action"; approvalId: string } | { kind: "open-sidepanel" } | { kind: "clear-log" } | { kind: "scan-page"; mode: "full" | "interactive" | "summary" | "suggestions" }): void {
+  private send(
+    request:
+      | SuggestedRequest
+      | { kind: "refresh-tabs" }
+      | { kind: "focus-tab"; tabId: number }
+      | { kind: "scan-tab"; tabId: number; mode: "full" | "interactive" | "summary" | "suggestions" }
+      | { kind: "approve-action"; approvalId: string }
+      | { kind: "reject-action"; approvalId: string }
+      | { kind: "refresh-bridge" }
+      | { kind: "refresh-semantic" }
+      | { kind: "open-sidepanel" }
+      | { kind: "clear-log" }
+      | { kind: "scan-page"; mode: "full" | "interactive" | "summary" | "suggestions" },
+  ): void {
     this.port?.postMessage(request);
   }
 
@@ -813,23 +1256,34 @@ export class BrowserCompanionApp {
       return;
     }
 
-    const parsed = parseInstruction(value, this.snapshot());
-    if (!parsed) {
+    const preview = buildWorkflowPlanFromInstruction(value, this.snapshot(), this.state?.workflow?.activeWorkflow ?? null);
+    if (!preview) {
       this.setFeedback("Could not parse that command. Try: click save, type hello into search, scroll down 600, summarize page.", "error");
       return;
     }
 
-    const request = parsed.request;
-    if (request.kind === "request-action") {
-      const activeTab = this.activeTab();
-      if (activeTab) {
-        request.action.tabId = activeTab.tabId;
-      }
+    this.commandInput.value = "";
+    this.setFeedback(preview.explanation, "info");
+    const activeWorkflowId = this.state?.workflow?.activeWorkflow?.workflowId ?? null;
+    const isResumingActiveWorkflow = activeWorkflowId !== null && preview.workflow.workflowId === activeWorkflowId;
+
+    if (!isResumingActiveWorkflow) {
+      this.port?.postMessage({ kind: "plan-workflow", workflow: preview.workflow });
     }
 
-    this.commandInput.value = "";
-    this.setFeedback(parsed.explanation, "info");
-    this.port?.postMessage(request);
+    if (preview.primaryRequest) {
+      const request = preview.primaryRequest;
+      if (request.kind === "request-action") {
+        const activeTab = this.activeTab();
+        if (activeTab) {
+          request.action.tabId = activeTab.tabId;
+        }
+      }
+
+      window.setTimeout(() => {
+        this.port?.postMessage(request);
+      }, 0);
+    }
   }
 }
 

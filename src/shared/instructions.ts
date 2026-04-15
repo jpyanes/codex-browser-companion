@@ -1,5 +1,5 @@
 import { DEFAULT_SCROLL_AMOUNT } from "./constants";
-import type { ActionRequest, PageSnapshot, SuggestedRequest, SuggestedRequestAction } from "./types";
+import type { ActionRequest, InteractiveElementSummary, PageSnapshot, SuggestedRequest, SuggestedRequestAction } from "./types";
 
 export interface ParsedInstruction {
   request: SuggestedRequest;
@@ -80,6 +80,15 @@ function findInteractiveElement(
   }
 
   return best && best.score >= 40 ? best.element : null;
+}
+
+function findEditableElement(snapshot: PageSnapshot): InteractiveElementSummary | null {
+  return (
+    snapshot.interactiveElements.find((element) => {
+      const tagName = element.tagName.toLowerCase();
+      return !element.isSensitive && (element.contentEditable === true || tagName === "textarea" || element.role.toLowerCase() === "textbox");
+    }) ?? null
+  );
 }
 
 function parseScrollInstruction(input: string): SuggestedRequestAction | null {
@@ -183,6 +192,80 @@ export function parseInstruction(input: string, snapshot: PageSnapshot | null): 
       explanation: "Generate suggested next actions from the current page.",
       confidence: 0.94,
     };
+  }
+
+  if (snapshot?.siteAdapter?.id === "linkedin-feed" && /^(like|react)\s+(?:the\s+)?(?:very\s+)?first\s+post$/.test(comparable)) {
+    const element = findInteractiveElement(snapshot, "like", { tags: ["button", "a", "summary", "input"] });
+    if (element) {
+      return {
+        request: {
+          kind: "request-action",
+          action: {
+            actionId: globalThis.crypto?.randomUUID?.() ?? `action_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+            tabId: snapshot.tabId,
+            kind: "click",
+            elementId: element.elementId,
+            label: element.label || element.text || "Like",
+            selector: element.selector,
+          },
+        },
+        explanation: 'Click the first visible Like control in the LinkedIn feed.',
+        confidence: 0.88,
+      };
+    }
+  }
+
+  if (
+    snapshot?.siteAdapter?.id === "google-docs" &&
+    /^(write|type|enter)\s+(.+)$/.test(trimmed) &&
+    !/\b(?:into|in|on)\b/.test(comparable)
+  ) {
+    const match = trimmed.match(/^(write|type|enter)\s+(.+)$/i);
+    if (match) {
+      const text = match[2]!.trim();
+      const element = findEditableElement(snapshot);
+      if (element) {
+        return {
+          request: {
+            kind: "request-action",
+            action: {
+              actionId: globalThis.crypto?.randomUUID?.() ?? `action_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+              tabId: snapshot.tabId,
+              kind: "type",
+              elementId: element.elementId,
+              text,
+              clearBeforeTyping: false,
+            },
+          },
+          explanation: "Type into the Google Docs editor surface.",
+          confidence: 0.86,
+        };
+      }
+    }
+  }
+
+  if (
+    snapshot?.siteAdapter?.id === "google-drive" &&
+    /^(new doc(?:ument)?|create doc(?:ument)?|open new doc(?:ument)?)$/.test(comparable)
+  ) {
+    const element = findInteractiveElement(snapshot, "new", { tags: ["button", "a", "summary"] }) ?? findInteractiveElement(snapshot, "blank", { tags: ["button", "a", "summary"] });
+    if (element) {
+      return {
+        request: {
+          kind: "request-action",
+          action: {
+            actionId: globalThis.crypto?.randomUUID?.() ?? `action_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+            tabId: snapshot.tabId,
+            kind: "click",
+            elementId: element.elementId,
+            label: element.label || element.text || "New",
+            selector: element.selector,
+          },
+        },
+        explanation: "Open the Google Drive New menu to create a new document.",
+        confidence: 0.82,
+      };
+    }
   }
 
   const scroll = parseScrollInstruction(trimmed);
