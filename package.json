@@ -1,0 +1,23 @@
+{
+  "name": "codex-browser-companion",
+  "private": true,
+  "version": "0.1.0",
+  "description": "A Chrome extension that lets Codex inspect and operate on the active tab with explicit user approval.",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "dev": "node scripts/watch.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.301",
+    "@types/jsdom": "^21.1.7",
+    "@types/node": "^22.15.0",
+    "esbuild": "^0.25.4",
+    "jsdom": "^26.1.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}

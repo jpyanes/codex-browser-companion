@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Codex Browser Companion",
+  "version": "0.1.0",
+  "description": "A Codex companion Chrome extension for inspecting the active tab, surfacing structured page context, and approving safe browser actions.",
+  "minimum_chrome_version": "114",
+  "permissions": ["activeTab", "scripting", "storage", "tabs", "sidePanel"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Codex Browser Companion",
+    "default_popup": "popup/index.html"
+  },
+  "side_panel": {
+    "default_path": "sidepanel/index.html"
+  }
+}
