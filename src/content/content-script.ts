@@ -1,8 +1,8 @@
 import { PAGE_MUTATION_DEBOUNCE_MS } from "../shared/constants";
-import { createActionResult, createSnapshotForMode, getActionScrollAmount, getElementTextSnapshot, isSensitiveElement } from "../shared/dom";
+import { capturePageState, createActionResult, createSnapshotForMode, getActionScrollAmount, getElementTextSnapshot, isSensitiveElement } from "../shared/dom";
 import { normalizeError, nowIso } from "../shared/logger";
 import { isContentRequest } from "../shared/messages";
-import type { ActionRequest, NavigationMode, PageSnapshot, PageStateBasic } from "../shared/types";
+import type { ActionRequest, NavigationMode, PageSnapshot } from "../shared/types";
 
 declare global {
   interface Window {
@@ -50,21 +50,7 @@ function schedulePageStateBroadcast(reason: "initial" | "mutation" | "navigation
 }
 
 async function broadcastPageState(reason: "initial" | "mutation" | "navigation" | "reload"): Promise<void> {
-  const pageState = createSnapshotForMode(document, "summary", getNavigationMode()).snapshot;
-  const state: PageStateBasic = {
-    url: pageState.url,
-    title: pageState.title,
-    readyState: document.readyState,
-    navigationMode: getNavigationMode(),
-    pageKind: pageState.pageKind,
-    interactiveCount: pageState.meta.interactiveCount,
-    formCount: pageState.meta.formCount,
-    visibleTextLength: pageState.meta.visibleTextLength,
-    hasSensitiveInputs: pageState.meta.hasSensitiveInputs,
-    siteAdapterId: pageState.siteAdapter?.id ?? null,
-    siteAdapterLabel: pageState.siteAdapter?.label ?? null,
-    updatedAt: nowIso(),
-  };
+  const state = capturePageState(document, getNavigationMode());
 
   await chrome.runtime.sendMessage({
     kind: "page-state",
@@ -391,23 +377,10 @@ function bootstrap(): void {
     void (async () => {
       switch (message.kind) {
         case "ping": {
-          const state = createSnapshotForMode(document, "summary", getNavigationMode());
-          runtimeState.registry = state.registry;
-          runtimeState.lastSnapshot = state.snapshot;
+          const state = capturePageState(document, getNavigationMode());
           sendResponse({
             kind: "ping",
-            state: {
-              url: state.snapshot.url,
-              title: state.snapshot.title,
-              readyState: document.readyState,
-              navigationMode: getNavigationMode(),
-              pageKind: state.snapshot.pageKind,
-              interactiveCount: state.snapshot.meta.interactiveCount,
-              formCount: state.snapshot.meta.formCount,
-              visibleTextLength: state.snapshot.meta.visibleTextLength,
-              hasSensitiveInputs: state.snapshot.meta.hasSensitiveInputs,
-              updatedAt: nowIso(),
-            },
+            state,
           });
           return;
         }

@@ -104,8 +104,36 @@ describe("page extraction", () => {
 
     expect(snapshot.pageKind).toBe("login");
     expect(snapshot.meta.hasSensitiveInputs).toBe(true);
+    expect(snapshot.userInterventionKind).toBe("login");
+    expect(snapshot.userInterventionMessage).toContain("sign in manually");
+    expect(snapshot.summary).toContain("sign in manually");
     expect(snapshot.forms[0]?.hasPasswordField).toBe(true);
     expect(snapshot.interactiveElements.some((element) => element.isSensitive)).toBe(true);
+  });
+
+  it("detects payment pages and prompts for a manual handoff", () => {
+    const document = makeDocument(`
+      <!doctype html>
+      <html>
+        <head><title>Checkout</title></head>
+        <body>
+          <form aria-label="Payment details">
+            <label for="card">Card number</label>
+            <input id="card" name="card" placeholder="1234 5678 9012 3456" />
+            <label for="name">Name on card</label>
+            <input id="name" name="name" />
+            <button type="submit">Pay now</button>
+          </form>
+        </body>
+      </html>
+    `);
+
+    const snapshot = capturePageSnapshot(document, { mode: "full", navigationMode: "document" }).snapshot;
+
+    expect(snapshot.pageKind).toBe("payment");
+    expect(snapshot.userInterventionKind).toBe("payment");
+    expect(snapshot.userInterventionMessage).toContain("payment manually");
+    expect(snapshot.summary).toContain("payment manually");
   });
 
   it("caps visible text for long article pages", () => {

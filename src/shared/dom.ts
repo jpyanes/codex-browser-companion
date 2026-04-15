@@ -17,6 +17,7 @@ import type {
   ScanMode,
   SemanticNode,
   SiteAdapterSummary,
+  UserInterventionSummary,
   SuggestedAction,
   SuggestedRequest,
 } from "./types";
@@ -59,6 +60,10 @@ function toIso() {
 
 function normalizeWhitespace(input: string): string {
   return input.replace(/\s+/g, " ").trim();
+}
+
+function normalizeComparable(input: string): string {
+  return normalizeWhitespace(input).toLowerCase().replace(/[^a-z0-9]+/g, " ");
 }
 
 function truncate(input: string, maxChars: number): string {
@@ -501,13 +506,34 @@ function captureSemanticOutline(document: Document, headings: HeadingSummary[]):
 }
 
 function derivePageKind(state: PageStateBasic, headings: HeadingSummary[], forms: FormSummary[]): PageKind {
-  const hasLoginSignals = forms.some((form) => form.hasPasswordField) || headings.some((heading) => /sign in|log in|login/i.test(heading.text));
+  const pageText = normalizeComparable(
+    [
+      state.title,
+      ...headings.map((heading) => heading.text),
+      ...forms.flatMap((form) => [
+        form.label,
+        form.action ?? "",
+        form.method ?? "",
+        ...form.fields.flatMap((field) => [field.label, field.placeholder, field.name, field.type].filter((value): value is string => typeof value === "string")),
+      ]),
+    ]
+      .filter(Boolean)
+      .join(" "),
+  );
+  const hasLoginSignals = forms.some((form) => form.hasPasswordField) || /(?:sign in|log in|login|authenticate|verify account)/.test(pageText);
+  const hasPaymentSignals =
+    /(?:checkout|payment|pay now|pay|billing|card|credit card|purchase|buy now|place order|order summary|subscription|donate|invoice|wallet|paypal)/.test(pageText) ||
+    /(?:card number|cvv|cvc|security code|expiration|expiry|mm yy|billing address|zip code|postal code|name on card|cardholder)/.test(pageText);
   const hasFormSignals = forms.length > 0;
   const isArticleLike = state.visibleTextLength > 3000 && headings.length >= 2;
   const isSpaLike = state.navigationMode === "spa";
 
   if (hasLoginSignals) {
     return "login";
+  }
+
+  if (hasPaymentSignals) {
+    return "payment";
   }
 
   if (hasFormSignals) {
@@ -529,6 +555,24 @@ function derivePageKind(state: PageStateBasic, headings: HeadingSummary[], forms
   return "document";
 }
 
+export function resolveUserIntervention(pageKind: PageKind | null | undefined): UserInterventionSummary | null {
+  if (pageKind === "login") {
+    return {
+      kind: "login",
+      message: "Login page detected. Please sign in manually, then type done to continue.",
+    };
+  }
+
+  if (pageKind === "payment") {
+    return {
+      kind: "payment",
+      message: "Payment page detected. Please complete the payment manually, then type done to continue.",
+    };
+  }
+
+  return null;
+}
+
 function summarizePageState(
   state: PageStateBasic,
   headings: HeadingSummary[],
@@ -547,6 +591,10 @@ function summarizePageState(
     if (siteAdapter.notes.length > 0) {
       parts.push(siteAdapter.notes[0]!);
     }
+  }
+
+  if (state.userInterventionMessage) {
+    parts.push(state.userInterventionMessage);
   }
 
   if (state.hasSensitiveInputs) {
@@ -655,16 +703,22 @@ export function capturePageState(document: Document, navigationMode: NavigationM
     hasSensitiveInputs,
     siteAdapterId: null,
     siteAdapterLabel: null,
+    userInterventionKind: null,
+    userInterventionMessage: null,
     updatedAt: toIso(),
   };
 
   const siteAdapter = resolveSiteAdapterFromState(provisionalState);
+  const pageKind = derivePageKind(provisionalState, headings, forms);
+  const userIntervention = resolveUserIntervention(pageKind);
 
   return {
     ...provisionalState,
-    pageKind: derivePageKind(provisionalState, headings, forms),
+    pageKind,
     siteAdapterId: siteAdapter?.id ?? null,
     siteAdapterLabel: siteAdapter?.label ?? null,
+    userInterventionKind: userIntervention?.kind ?? null,
+    userInterventionMessage: userIntervention?.message ?? null,
   };
 }
 
@@ -687,11 +741,19 @@ export function capturePageSnapshot(document: Document, options: SnapshotCapture
     hasSensitiveInputs: forms.some((form) => form.hasPasswordField || form.hasFileField),
     siteAdapterId: null,
     siteAdapterLabel: null,
+    userInterventionKind: null,
+    userInterventionMessage: null,
     updatedAt: toIso(),
   };
 
   const pageKind = derivePageKind(pageState, headings, forms);
-  const completedState = { ...pageState, pageKind };
+  const userIntervention = resolveUserIntervention(pageKind);
+  const completedState = {
+    ...pageState,
+    pageKind,
+    userInterventionKind: userIntervention?.kind ?? null,
+    userInterventionMessage: userIntervention?.message ?? null,
+  };
   const semanticOutline = captureSemanticOutline(document, headings);
   const siteResolution = resolveSiteAdapterSnapshot({
     snapshotId: "",
@@ -758,6 +820,8 @@ export function capturePageSnapshot(document: Document, options: SnapshotCapture
     interactiveElements,
     semanticOutline,
     siteAdapter: siteResolution.siteAdapter,
+    userInterventionKind: completedState.userInterventionKind,
+    userInterventionMessage: completedState.userInterventionMessage,
   };
 
   const snapshot: PageSnapshot = {
@@ -791,7 +855,8 @@ export function createActionResult(action: ActionRequest, tabId: number, success
 
 export function buildPageStateSummary(pageState: PageStateBasic): string {
   const adapterLabel = pageState.siteAdapterLabel ? ` ${pageState.siteAdapterLabel} detected.` : "";
-  return `${pageState.title || "Untitled"} on ${new URL(pageState.url).hostname}.${adapterLabel} ${pageState.pageKind} page with ${pageState.interactiveCount} interactive controls and ${pageState.formCount} forms.`;
+  const interventionLabel = pageState.userInterventionMessage ? ` ${pageState.userInterventionMessage}` : "";
+  return `${pageState.title || "Untitled"} on ${new URL(pageState.url).hostname}.${adapterLabel} ${pageState.pageKind} page with ${pageState.interactiveCount} interactive controls and ${pageState.formCount} forms.${interventionLabel}`;
 }
 
 export function getActionScrollAmount(action: ActionRequest): number {
@@ -811,6 +876,8 @@ export function isSensitiveElement(element: HTMLElement): boolean {
 }
 
 export function resolvePageStateFromSnapshot(snapshot: PageSnapshot): PageStateBasic {
+  const userIntervention = resolveUserIntervention(snapshot.pageKind);
+
   return {
     url: snapshot.url,
     title: snapshot.title,
@@ -823,6 +890,8 @@ export function resolvePageStateFromSnapshot(snapshot: PageSnapshot): PageStateB
     hasSensitiveInputs: snapshot.meta.hasSensitiveInputs,
     siteAdapterId: snapshot.siteAdapter?.id ?? null,
     siteAdapterLabel: snapshot.siteAdapter?.label ?? null,
+    userInterventionKind: userIntervention?.kind ?? null,
+    userInterventionMessage: userIntervention?.message ?? null,
     updatedAt: snapshot.capturedAt,
   };
 }

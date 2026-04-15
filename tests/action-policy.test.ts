@@ -1,5 +1,5 @@
 import { JSDOM } from "jsdom";
-import { buildApprovalRequest, canAutoExecute, classifyDanger, isBlockedSensitiveAction, requiresApproval } from "../src/shared/action-policy";
+import { buildApprovalRequest, canAutoExecute, classifyDanger, isBlockedSensitiveAction, requiresApproval, requiresManualIntervention } from "../src/shared/action-policy";
 import { capturePageSnapshot } from "../src/shared/dom";
 import type { ActionRequest } from "../src/shared/types";
 
@@ -53,6 +53,31 @@ describe("action policy", () => {
     const typeAction = action("type", { elementId: "password", text: "secret" } as Partial<ActionRequest>);
     const submitAction = action("submit-form", { elementId: "form-1" } as Partial<ActionRequest>);
 
+    expect(isBlockedSensitiveAction(typeAction, snapshot)).toBe(true);
+    expect(isBlockedSensitiveAction(submitAction, snapshot)).toBe(true);
+  });
+
+  it("blocks typing and form submission on payment pages", () => {
+    const document = makeDocument(`
+      <!doctype html>
+      <html>
+        <head><title>Checkout</title></head>
+        <body>
+          <form aria-label="Payment details">
+            <label for="card">Card number</label>
+            <input id="card" name="card" />
+            <button type="submit">Pay now</button>
+          </form>
+        </body>
+      </html>
+    `);
+
+    const snapshot = capturePageSnapshot(document, { mode: "full", navigationMode: "document" }).snapshot;
+    const typeAction = action("type", { elementId: "card", text: "4242 4242 4242 4242" } as Partial<ActionRequest>);
+    const submitAction = action("submit-form", { elementId: "form-1" } as Partial<ActionRequest>);
+
+    expect(snapshot.pageKind).toBe("payment");
+    expect(requiresManualIntervention(snapshot)).toBe(true);
     expect(isBlockedSensitiveAction(typeAction, snapshot)).toBe(true);
     expect(isBlockedSensitiveAction(submitAction, snapshot)).toBe(true);
   });

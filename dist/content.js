@@ -56,7 +56,7 @@
     "publish"
   ];
   function isLikelySensitiveSnapshot(snapshot) {
-    return Boolean(snapshot?.meta.hasSensitiveInputs || snapshot?.pageKind === "login");
+    return Boolean(snapshot?.meta.hasSensitiveInputs || snapshot?.pageKind === "login" || snapshot?.pageKind === "payment");
   }
   function classifyDanger(action, snapshot) {
     if (action.kind === "submit-form") {
@@ -301,6 +301,9 @@
   }
   function normalizeWhitespace(input) {
     return input.replace(/\s+/g, " ").trim();
+  }
+  function normalizeComparable(input) {
+    return normalizeWhitespace(input).toLowerCase().replace(/[^a-z0-9]+/g, " ");
   }
   function truncate(input, maxChars) {
     if (input.length <= maxChars) {
@@ -658,12 +661,28 @@
     return [...landmarks, ...headingNodes];
   }
   function derivePageKind(state, headings, forms) {
-    const hasLoginSignals = forms.some((form) => form.hasPasswordField) || headings.some((heading) => /sign in|log in|login/i.test(heading.text));
+    const pageText = normalizeComparable(
+      [
+        state.title,
+        ...headings.map((heading) => heading.text),
+        ...forms.flatMap((form) => [
+          form.label,
+          form.action ?? "",
+          form.method ?? "",
+          ...form.fields.flatMap((field) => [field.label, field.placeholder, field.name, field.type].filter((value) => typeof value === "string"))
+        ])
+      ].filter(Boolean).join(" ")
+    );
+    const hasLoginSignals = forms.some((form) => form.hasPasswordField) || /(?:sign in|log in|login|authenticate|verify account)/.test(pageText);
+    const hasPaymentSignals = /(?:checkout|payment|pay now|pay|billing|card|credit card|purchase|buy now|place order|order summary|subscription|donate|invoice|wallet|paypal)/.test(pageText) || /(?:card number|cvv|cvc|security code|expiration|expiry|mm yy|billing address|zip code|postal code|name on card|cardholder)/.test(pageText);
     const hasFormSignals = forms.length > 0;
     const isArticleLike = state.visibleTextLength > 3e3 && headings.length >= 2;
     const isSpaLike = state.navigationMode === "spa";
     if (hasLoginSignals) {
       return "login";
+    }
+    if (hasPaymentSignals) {
+      return "payment";
     }
     if (hasFormSignals) {
       return "form";
@@ -679,6 +698,21 @@
     }
     return "document";
   }
+  function resolveUserIntervention(pageKind) {
+    if (pageKind === "login") {
+      return {
+        kind: "login",
+        message: "Login page detected. Please sign in manually, then type done to continue."
+      };
+    }
+    if (pageKind === "payment") {
+      return {
+        kind: "payment",
+        message: "Payment page detected. Please complete the payment manually, then type done to continue."
+      };
+    }
+    return null;
+  }
   function summarizePageState(state, headings, forms, interactiveCount, siteAdapter) {
     const kindLabel = state.pageKind === "unknown" ? "page" : `${state.pageKind} page`;
     const parts = [
@@ -690,6 +724,9 @@
       if (siteAdapter.notes.length > 0) {
         parts.push(siteAdapter.notes[0]);
       }
+    }
+    if (state.userInterventionMessage) {
+      parts.push(state.userInterventionMessage);
     }
     if (state.hasSensitiveInputs) {
       parts.push("Sensitive inputs are present. Password values are not captured and the extension will not type into them.");
@@ -770,6 +807,41 @@
     }
     return suggestions.slice(0, 4);
   }
+  function capturePageState(document2, navigationMode) {
+    const registry = createRegistryHandle();
+    const interactiveCount = captureInteractiveElements(document2, registry).length;
+    const forms = captureForms(document2, registry);
+    const visibleText = extractVisibleText(document2.body ?? document2.documentElement);
+    const headings = extractHeadings(document2);
+    const hasSensitiveInputs = forms.some((form) => form.hasPasswordField || form.hasFileField);
+    const provisionalState = {
+      url: document2.location.href,
+      title: cleanText(document2.title || "Untitled"),
+      readyState: document2.readyState,
+      navigationMode,
+      pageKind: "unknown",
+      interactiveCount,
+      formCount: forms.length,
+      visibleTextLength: visibleText.length,
+      hasSensitiveInputs,
+      siteAdapterId: null,
+      siteAdapterLabel: null,
+      userInterventionKind: null,
+      userInterventionMessage: null,
+      updatedAt: toIso()
+    };
+    const siteAdapter = resolveSiteAdapterFromState(provisionalState);
+    const pageKind = derivePageKind(provisionalState, headings, forms);
+    const userIntervention = resolveUserIntervention(pageKind);
+    return {
+      ...provisionalState,
+      pageKind,
+      siteAdapterId: siteAdapter?.id ?? null,
+      siteAdapterLabel: siteAdapter?.label ?? null,
+      userInterventionKind: userIntervention?.kind ?? null,
+      userInterventionMessage: userIntervention?.message ?? null
+    };
+  }
   function capturePageSnapshot(document2, options) {
     const registry = createRegistryHandle();
     const visibleText = options.mode === "interactive" ? "" : extractVisibleText(document2.body ?? document2.documentElement);
@@ -789,10 +861,18 @@
       hasSensitiveInputs: forms.some((form) => form.hasPasswordField || form.hasFileField),
       siteAdapterId: null,
       siteAdapterLabel: null,
+      userInterventionKind: null,
+      userInterventionMessage: null,
       updatedAt: toIso()
     };
     const pageKind = derivePageKind(pageState, headings, forms);
-    const completedState = { ...pageState, pageKind };
+    const userIntervention = resolveUserIntervention(pageKind);
+    const completedState = {
+      ...pageState,
+      pageKind,
+      userInterventionKind: userIntervention?.kind ?? null,
+      userInterventionMessage: userIntervention?.message ?? null
+    };
     const semanticOutline = captureSemanticOutline(document2, headings);
     const siteResolution = resolveSiteAdapterSnapshot({
       snapshotId: "",
@@ -858,7 +938,9 @@
       forms,
       interactiveElements,
       semanticOutline,
-      siteAdapter: siteResolution.siteAdapter
+      siteAdapter: siteResolution.siteAdapter,
+      userInterventionKind: completedState.userInterventionKind,
+      userInterventionMessage: completedState.userInterventionMessage
     };
     const snapshot = {
       ...snapshotBase,
@@ -923,7 +1005,7 @@
   function getNavigationMode() {
     return runtimeState.navigationMode;
   }
-  function normalizeComparable(input) {
+  function normalizeComparable2(input) {
     return input.trim().toLowerCase().replace(/[^a-z0-9]+/g, " ");
   }
   function schedulePageStateBroadcast(reason) {
@@ -936,21 +1018,7 @@
     }, PAGE_MUTATION_DEBOUNCE_MS);
   }
   async function broadcastPageState(reason) {
-    const pageState = createSnapshotForMode(document, "summary", getNavigationMode()).snapshot;
-    const state = {
-      url: pageState.url,
-      title: pageState.title,
-      readyState: document.readyState,
-      navigationMode: getNavigationMode(),
-      pageKind: pageState.pageKind,
-      interactiveCount: pageState.meta.interactiveCount,
-      formCount: pageState.meta.formCount,
-      visibleTextLength: pageState.meta.visibleTextLength,
-      hasSensitiveInputs: pageState.meta.hasSensitiveInputs,
-      siteAdapterId: pageState.siteAdapter?.id ?? null,
-      siteAdapterLabel: pageState.siteAdapter?.label ?? null,
-      updatedAt: nowIso()
-    };
+    const state = capturePageState(document, getNavigationMode());
     await chrome.runtime.sendMessage({
       kind: "page-state",
       state,
@@ -998,15 +1066,15 @@
     element.dispatchEvent(new Event("change", { bubbles: true, cancelable: true, composed: true }));
   }
   function selectOption(select, selection) {
-    const normalized = normalizeComparable(String(selection.selection.value));
+    const normalized = normalizeComparable2(String(selection.selection.value));
     const options = Array.from(select.options);
     let chosenIndex = -1;
     if (selection.selection.by === "index") {
       chosenIndex = Number.parseInt(String(selection.selection.value), 10);
     } else if (selection.selection.by === "value") {
-      chosenIndex = options.findIndex((option) => normalizeComparable(option.value) === normalized);
+      chosenIndex = options.findIndex((option) => normalizeComparable2(option.value) === normalized);
     } else {
-      chosenIndex = options.findIndex((option) => normalizeComparable(option.textContent ?? "") === normalized);
+      chosenIndex = options.findIndex((option) => normalizeComparable2(option.textContent ?? "") === normalized);
     }
     if (chosenIndex < 0 || !options[chosenIndex]) {
       throw new Error(`Could not find an option matching "${selection.selection.value}".`);
@@ -1043,13 +1111,13 @@
     }
   }
   function resolveSelectorByText(selector) {
-    const comparable = normalizeComparable(selector.replace(/^text=/i, "").replace(/^aria=/i, ""));
+    const comparable = normalizeComparable2(selector.replace(/^text=/i, "").replace(/^aria=/i, ""));
     if (!comparable) {
       return null;
     }
     const candidates = Array.from(runtimeState.registry.values()).filter((element) => element instanceof HTMLElement);
     for (const element of candidates) {
-      const label = normalizeComparable(
+      const label = normalizeComparable2(
         `${element.getAttribute("aria-label") ?? ""} ${element.getAttribute("title") ?? ""} ${getElementTextSnapshot(element)}`
       );
       if (label.includes(comparable)) {
@@ -1220,23 +1288,10 @@
       void (async () => {
         switch (message.kind) {
           case "ping": {
-            const state = createSnapshotForMode(document, "summary", getNavigationMode());
-            runtimeState.registry = state.registry;
-            runtimeState.lastSnapshot = state.snapshot;
+            const state = capturePageState(document, getNavigationMode());
             sendResponse({
               kind: "ping",
-              state: {
-                url: state.snapshot.url,
-                title: state.snapshot.title,
-                readyState: document.readyState,
-                navigationMode: getNavigationMode(),
-                pageKind: state.snapshot.pageKind,
-                interactiveCount: state.snapshot.meta.interactiveCount,
-                formCount: state.snapshot.meta.formCount,
-                visibleTextLength: state.snapshot.meta.visibleTextLength,
-                hasSensitiveInputs: state.snapshot.meta.hasSensitiveInputs,
-                updatedAt: nowIso()
-              }
+              state
             });
             return;
           }

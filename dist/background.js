@@ -154,7 +154,10 @@ function requiresApproval(action) {
   return action.kind === "click" || action.kind === "type" || action.kind === "select" || action.kind === "submit-form";
 }
 function isLikelySensitiveSnapshot(snapshot) {
-  return Boolean(snapshot?.meta.hasSensitiveInputs || snapshot?.pageKind === "login");
+  return Boolean(snapshot?.meta.hasSensitiveInputs || snapshot?.pageKind === "login" || snapshot?.pageKind === "payment");
+}
+function requiresManualIntervention(snapshot) {
+  return Boolean(snapshot && (snapshot.pageKind === "login" || snapshot.pageKind === "payment"));
 }
 function canAutoExecute(action) {
   return action.kind === "scroll" || action.kind === "navigate-back" || action.kind === "navigate-forward" || action.kind === "refresh";
@@ -948,6 +951,9 @@ function markWorkflowRequestCompleted(state2, context, resultSummary) {
 function markWorkflowRequestFailed(state2, context, reason) {
   return updateWorkflowStepByContext(state2, context, "failed", reason);
 }
+function getActiveWorkflowNextRequest(state2) {
+  return getWorkflowNextStep(state2?.activeWorkflow ?? null)?.request ?? null;
+}
 
 // src/shared/tab-orchestration.ts
 function summarizeTrackedTab(tab) {
@@ -960,6 +966,9 @@ function summarizeTrackedTab(tab) {
     pieces.push(`${tab.pageState.pageKind}`);
     if (tab.pageState.siteAdapterLabel) {
       pieces.push(tab.pageState.siteAdapterLabel);
+    }
+    if (tab.pageState.userInterventionKind) {
+      pieces.push(`waiting for ${tab.pageState.userInterventionKind}`);
     }
     pieces.push(`${tab.pageState.interactiveCount} interactive`);
   }
@@ -1041,7 +1050,23 @@ async function requestSemanticObservation(snapshot, endpoint = DEFAULT_SEMANTIC_
 }
 
 // src/shared/dom.ts
+function resolveUserIntervention(pageKind) {
+  if (pageKind === "login") {
+    return {
+      kind: "login",
+      message: "Login page detected. Please sign in manually, then type done to continue."
+    };
+  }
+  if (pageKind === "payment") {
+    return {
+      kind: "payment",
+      message: "Payment page detected. Please complete the payment manually, then type done to continue."
+    };
+  }
+  return null;
+}
 function resolvePageStateFromSnapshot(snapshot) {
+  const userIntervention = resolveUserIntervention(snapshot.pageKind);
   return {
     url: snapshot.url,
     title: snapshot.title,
@@ -1054,6 +1079,8 @@ function resolvePageStateFromSnapshot(snapshot) {
     hasSensitiveInputs: snapshot.meta.hasSensitiveInputs,
     siteAdapterId: snapshot.siteAdapter?.id ?? null,
     siteAdapterLabel: snapshot.siteAdapter?.label ?? null,
+    userInterventionKind: userIntervention?.kind ?? null,
+    userInterventionMessage: userIntervention?.message ?? null,
     updatedAt: snapshot.capturedAt
   };
 }
@@ -1180,19 +1207,35 @@ function deriveStatus() {
   if (!active) {
     return "idle";
   }
-  if (active.lastError) {
-    return "error";
-  }
   if (active.busy) {
     return "running";
+  }
+  if (getManualIntervention(active)) {
+    return "awaiting-user";
+  }
+  if (active.lastError) {
+    return "error";
   }
   if (active.approvals.some((approval) => approval.status === "pending" || approval.status === "executing")) {
     return "awaiting-approval";
   }
-  if (active.contentReady) {
-    return "connected";
+  return active.contentReady ? "connected" : "idle";
+}
+function getManualIntervention(tab) {
+  if (!tab) {
+    return null;
   }
-  return "idle";
+  const pageIntervention = resolveUserIntervention(tab.pageState?.userInterventionKind ?? tab.pageState?.pageKind ?? null);
+  if (pageIntervention) {
+    return pageIntervention;
+  }
+  if (!requiresManualIntervention(tab.snapshot)) {
+    return null;
+  }
+  return resolveUserIntervention(tab.snapshot?.pageKind ?? null);
+}
+function isAwaitingUserIntervention(tab) {
+  return Boolean(getManualIntervention(tab));
 }
 async function persistState() {
   await writeSessionValue(STORAGE_KEY_STATE, state);
@@ -1235,6 +1278,9 @@ function updateBadge() {
   if (active?.busy) {
     text = "RUN";
     color = "#0f766e";
+  } else if (isAwaitingUserIntervention(active)) {
+    text = "WAIT";
+    color = "#ca8a04";
   } else if (approvalCount > 0) {
     text = approvalCount > 99 ? "99+" : String(approvalCount);
     color = "#c2410c";
@@ -1378,6 +1424,12 @@ function pushLog(tabId, level, message, details) {
     activityLog: truncateEntries([...current.activityLog, entry], MAX_ACTIVITY_LOG_ENTRIES),
     lastSeenAt: nowIso()
   }));
+}
+function logManualInterventionTransition(tabId, previousKind, pageState) {
+  if (!pageState.userInterventionKind || pageState.userInterventionKind === previousKind) {
+    return;
+  }
+  pushLog(tabId, "warning", `Manual ${pageState.userInterventionKind} step detected.`, pageState.userInterventionMessage ?? "Please complete the step manually, then type done to continue.");
 }
 function markBusy(tabId, busy) {
   replaceTabState(tabId, (current) => ({
@@ -1570,6 +1622,7 @@ async function capturePageFromTab(tabId, mode) {
 async function recordSnapshot(tabId, mode) {
   const snapshot = await capturePageFromTab(tabId, mode);
   const pageState = resolvePageStateFromSnapshot(snapshot);
+  const previousInterventionKind = getTabState(tabId).pageState?.userInterventionKind;
   replaceTabState(tabId, (current) => ({
     ...current,
     snapshot,
@@ -1579,6 +1632,7 @@ async function recordSnapshot(tabId, mode) {
     lastError: null,
     lastSeenAt: nowIso()
   }));
+  logManualInterventionTransition(tabId, previousInterventionKind, pageState);
   state.workflow = recordWorkflowPageState(state.workflow, tabId, pageState, snapshot);
   pushLog(tabId, "success", `Captured ${mode} page snapshot.`, `Interactive controls: ${snapshot.interactiveElements.length}`);
   commit({ kind: "page-snapshot", tabId, snapshot });
@@ -1664,8 +1718,13 @@ async function queueActionForApproval(action) {
   }
   const tabState = getTabState(tabId);
   const snapshot = tabState.snapshot;
+  if (isAwaitingUserIntervention(tabState)) {
+    const intervention = getManualIntervention(tabState);
+    pushLog(tabId, "warning", "Paused for a manual browser step.", intervention?.message ?? "Complete the login or payment step manually, then type done to continue.");
+    commit();
+    return;
+  }
   if (isBlockedSensitiveAction(action, snapshot)) {
-    state.workflow = markWorkflowStepFailed(state.workflow, action, "Sensitive fields are not supported in v1.");
     const error = normalizeError("Sensitive form fields are not supported in v1.", "SENSITIVE_FIELD_BLOCKED", {
       tabId,
       recoverable: true
@@ -1690,6 +1749,12 @@ async function queueActionForApproval(action) {
 async function executeApprovedAction(tabId, action, approvalId) {
   const tabState = getTabState(tabId);
   const snapshot = tabState.snapshot;
+  if (isAwaitingUserIntervention(tabState)) {
+    const intervention = getManualIntervention(tabState);
+    pushLog(tabId, "warning", "Paused for a manual browser step.", intervention?.message ?? "Complete the login or payment step manually, then type done to continue.");
+    commit();
+    return;
+  }
   if (requiresApproval(action)) {
     if (!approvalId) {
       throw new Error("Action requires approval before execution.");
@@ -1802,6 +1867,26 @@ async function rejectAction(approvalId) {
   }));
   pushLog(tabId, "warning", "Rejected an action request.", updated.title);
   commit({ kind: "approval-updated", approval: updated });
+}
+async function resumeManualIntervention() {
+  const tabId = state.activeTabId;
+  if (tabId === null) {
+    return;
+  }
+  await syncActiveTab(tabId);
+  pushLog(tabId, "info", "Manual step completed.", "Rescanning the current page and resuming the workflow.");
+  await scanActiveTab("suggestions");
+  const tabState = getTabState(tabId);
+  const intervention = getManualIntervention(tabState);
+  if (intervention) {
+    pushLog(tabId, "warning", "Manual step is still pending.", intervention.message);
+    commit();
+    return;
+  }
+  const nextRequest = state.workflow.activeWorkflow ? getActiveWorkflowNextRequest(state.workflow) : null;
+  if (nextRequest?.kind === "request-action") {
+    await queueActionForApproval(nextRequest.action);
+  }
 }
 async function openSidePanel() {
   const tabId = state.activeTabId;
@@ -1918,6 +2003,9 @@ async function handleUiRequest(port, request) {
     case "refresh-semantic":
       await refreshSemanticStatus();
       return;
+    case "resume-user-intervention":
+      await resumeManualIntervention();
+      return;
     case "open-sidepanel":
       await openSidePanel();
       return;
@@ -1939,6 +2027,7 @@ async function handleContentEvent(message, sender) {
   }
   switch (message.kind) {
     case "page-state": {
+      const previousInterventionKind = getTabState(tabId).pageState?.userInterventionKind;
       const nextState = {
         ...message.state,
         url: message.state.url,
@@ -1955,6 +2044,7 @@ async function handleContentEvent(message, sender) {
         lastError: null,
         lastSeenAt: nowIso()
       }));
+      logManualInterventionTransition(tabId, previousInterventionKind, nextState);
       state.workflow = recordWorkflowPageState(state.workflow, tabId, nextState, null);
       commit();
       return;

@@ -32,7 +32,11 @@ export function requiresApproval(action: ActionRequest): boolean {
 }
 
 export function isLikelySensitiveSnapshot(snapshot: PageSnapshot | null): boolean {
-  return Boolean(snapshot?.meta.hasSensitiveInputs || snapshot?.pageKind === "login");
+  return Boolean(snapshot?.meta.hasSensitiveInputs || snapshot?.pageKind === "login" || snapshot?.pageKind === "payment");
+}
+
+export function requiresManualIntervention(snapshot: PageSnapshot | null): boolean {
+  return Boolean(snapshot && (snapshot.pageKind === "login" || snapshot.pageKind === "payment"));
 }
 
 export function isSensitiveInteractiveElement(element: InteractiveElementSummary): boolean {

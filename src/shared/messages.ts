@@ -26,6 +26,7 @@ type MessageKind =
   | "reject-action"
   | "refresh-bridge"
   | "refresh-semantic"
+  | "resume-user-intervention"
   | "open-sidepanel"
   | "clear-log"
   | "ping"
@@ -121,6 +122,10 @@ export interface UiRefreshSemanticRequest extends MessageEnvelopeBase {
   kind: "refresh-semantic";
 }
 
+export interface UiResumeUserInterventionRequest extends MessageEnvelopeBase {
+  kind: "resume-user-intervention";
+}
+
 export interface UiOpenSidePanelRequest extends MessageEnvelopeBase {
   kind: "open-sidepanel";
 }
@@ -144,6 +149,7 @@ export type UiRequest =
   | UiRejectActionRequest
   | UiRefreshBridgeRequest
   | UiRefreshSemanticRequest
+  | UiResumeUserInterventionRequest
   | UiOpenSidePanelRequest
   | UiClearLogRequest;
 

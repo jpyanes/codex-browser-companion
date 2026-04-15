@@ -1,6 +1,6 @@
-export type AssistantConnectionState = "idle" | "connected" | "running" | "awaiting-approval" | "error";
+export type AssistantConnectionState = "idle" | "connected" | "running" | "awaiting-approval" | "awaiting-user" | "error";
 export type NavigationMode = "document" | "spa";
-export type PageKind = "unknown" | "document" | "mixed" | "article" | "form" | "login" | "spa";
+export type PageKind = "unknown" | "document" | "mixed" | "article" | "form" | "login" | "payment" | "spa";
 export type ScanMode = "full" | "interactive" | "summary" | "suggestions";
 export type LogLevel = "debug" | "info" | "success" | "warning" | "error";
 export type ApprovalStatus = "pending" | "approved" | "rejected" | "executing" | "succeeded" | "failed";
@@ -10,6 +10,7 @@ export type WorkflowStatus = "active" | "paused" | "completed" | "abandoned" | "
 export type WorkflowStepStatus = "pending" | "queued" | "completed" | "blocked" | "failed";
 export type WorkflowStepSource = "command" | "planner" | "memory";
 export type SiteAdapterKind = "social-feed" | "document-editor" | "workspace-login" | "workspace-app" | "general";
+export type UserInterventionKind = "login" | "payment";
 
 export interface BoxRect {
   x: number;
@@ -21,6 +22,11 @@ export interface BoxRect {
 export interface WorkflowRequestContext {
   workflowId?: string;
   workflowStepId?: string;
+}
+
+export interface UserInterventionSummary {
+  kind: UserInterventionKind;
+  message: string;
 }
 
 export interface PageStateBasic {
@@ -35,6 +41,8 @@ export interface PageStateBasic {
   hasSensitiveInputs: boolean;
   siteAdapterId: string | null;
   siteAdapterLabel: string | null;
+  userInterventionKind?: UserInterventionKind | null;
+  userInterventionMessage?: string | null;
   updatedAt: string;
 }
 
@@ -313,6 +321,8 @@ export interface PageSnapshot {
   interactiveElements: InteractiveElementSummary[];
   semanticOutline: SemanticNode[];
   siteAdapter: SiteAdapterSummary | null;
+  userInterventionKind?: UserInterventionKind | null;
+  userInterventionMessage?: string | null;
   suggestedActions: SuggestedAction[];
   summary: string;
 }

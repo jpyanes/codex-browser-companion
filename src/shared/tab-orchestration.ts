@@ -37,6 +37,10 @@ export function sortTrackedTabs(tabs: TrackedTabState[], activeTabId: number | n
 }
 
 export function tabStatusTone(tab: TrackedTabState, activeTabId: number | null): "neutral" | "warning" | "success" | "danger" {
+  if (tab.pageState?.userInterventionKind || tab.pageState?.pageKind === "login" || tab.pageState?.pageKind === "payment") {
+    return "warning";
+  }
+
   if (tab.lastError) {
     return "danger";
   }
@@ -61,6 +65,10 @@ export function tabStatusTone(tab: TrackedTabState, activeTabId: number | null):
 }
 
 export function tabStatusLabel(tab: TrackedTabState, activeTabId: number | null): string {
+  if (tab.pageState?.userInterventionKind || tab.pageState?.pageKind === "login" || tab.pageState?.pageKind === "payment") {
+    return tab.tabId === activeTabId ? "Waiting for you" : "User action needed";
+  }
+
   if (tab.lastError) {
     return "Error";
   }
@@ -103,6 +111,9 @@ export function summarizeTrackedTab(tab: TrackedTabState): string {
     pieces.push(`${tab.pageState.pageKind}`);
     if (tab.pageState.siteAdapterLabel) {
       pieces.push(tab.pageState.siteAdapterLabel);
+    }
+    if (tab.pageState.userInterventionKind) {
+      pieces.push(`waiting for ${tab.pageState.userInterventionKind}`);
     }
     pieces.push(`${tab.pageState.interactiveCount} interactive`);
   }

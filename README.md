@@ -204,6 +204,7 @@ This extension is intentionally conservative.
 
 - It never captures password values.
 - It does not type into or submit sensitive fields such as login forms.
+- When it detects a login or payment page, it switches into `awaiting-user` mode, shows a manual handoff banner, and waits for you to finish the step before continuing.
 - It restricts actions to the active tab.
 - It requires explicit approval for click, type, select, and submit actions.
 - It does not send page data to a remote service.
@@ -219,6 +220,7 @@ If a page is not inspectable, the extension refuses to inject or act and surface
 - `chrome://`, extension pages, and other browser-internal pages are not inspectable.
 - Cross-origin iframe content is not deeply inspected.
 - Password and file inputs are intentionally excluded from v1 automation.
+- Login and payment pages intentionally pause the assistant until you complete the sensitive step and resume with `done`.
 - The command box only understands a safe subset of browser commands in v1.
 - The local Playwriter relay bridge is separate from the Codex UI and must be started explicitly with `npm run bridge`.
 - The Playwriter relay bridge must be running for live-session attachment; otherwise the bridge panel will show it as disconnected.
@@ -251,31 +253,37 @@ Use these page types after loading the unpacked extension:
    - Open a page with password inputs.
    - Confirm password fields are flagged as sensitive.
    - Verify the extension refuses to type into them.
+   - Confirm the UI switches to "Waiting for you" and resumes after you complete the login and type `done`.
 
-5. Long article page
+5. Payment page
+   - Open a checkout or payment form.
+   - Confirm the extension pauses with a manual handoff banner.
+   - Complete the payment manually and type `done` to resume.
+
+6. Long article page
    - Open a long reading page with multiple headings.
    - Run `Summarize page`.
    - Confirm the visible text is capped and the outline is readable.
 
-6. Live bridge
+7. Live bridge
    - Run `npm run bridge` in a terminal.
    - Enable the Playwriter extension on a tab in your existing Chrome session.
    - Confirm the bridge panel changes to connected.
    - Refresh the current tab and confirm the active tab context still updates normally.
 
-7. Semantic bridge
+8. Semantic bridge
    - Set `STAGEHAND_MODEL` and the matching provider API key if you want semantic suggestions.
    - Run `npm run semantic` in a terminal.
    - Open a page with visible buttons or links.
    - Run `Suggest next` and confirm the Stagehand-backed suggestions appear alongside the DOM suggestions.
 
-8. Workflow memory
+9. Workflow memory
    - Open a page with at least one visible button or control.
    - Enter a multi-step command such as `click save changes and then summarize page`.
    - Confirm the workflow panel appears with the plan steps and current step highlight.
    - Complete the first step and verify the next step becomes available from workflow memory.
 
-9. Multi-tab orchestration
+10. Multi-tab orchestration
    - Open a few web pages in different tabs.
    - Click `Refresh tabs` and confirm the tab inventory fills in.
    - Use `Focus` on a non-active tab and confirm the browser moves there.

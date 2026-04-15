@@ -4,6 +4,7 @@ import { normalizeError, nowIso } from "../shared/logger";
 import { semanticStatusLabel, semanticStatusTone, summarizeSemanticState } from "../shared/semantic";
 import { sortTrackedTabs, summarizeTrackedTab, tabStatusLabel, tabStatusTone } from "../shared/tab-orchestration";
 import { searchTrackedTabs } from "../shared/tab-intelligence";
+import { resolveUserIntervention } from "../shared/dom";
 import {
   buildWorkflowPlanFromInstruction,
   getActiveWorkflowNextStep,
@@ -125,6 +126,8 @@ function statusLabel(status: ExtensionState["status"]): string {
       return "Running";
     case "awaiting-approval":
       return "Awaiting approval";
+    case "awaiting-user":
+      return "Waiting for you";
     case "error":
       return "Error";
   }
@@ -142,6 +145,18 @@ function commandHint(mode: AppMode): string {
 
 function getPageState(tab: TrackedTabState | null): PageSnapshot | null {
   return tab?.snapshot ?? null;
+}
+
+function getTabIntervention(tab: TrackedTabState | null): { kind: "login" | "payment"; message: string } | null {
+  if (!tab) {
+    return null;
+  }
+
+  return resolveUserIntervention(tab.pageState?.userInterventionKind ?? tab.pageState?.pageKind ?? tab.snapshot?.pageKind ?? null);
+}
+
+function isResumeSignal(input: string): boolean {
+  return /^(done|i'?m done|im done|finished|complete|resume|continue)[.!]?$/i.test(input.trim());
 }
 
 function renderChip(label: string, tone = "neutral"): string {
@@ -319,6 +334,7 @@ function renderSummary(tab: TrackedTabState | null, snapshot: PageSnapshot | nul
   }
 
   const pageState = tab.pageState;
+  const intervention = getTabIntervention(tab);
   const freshState = tab.snapshotFresh ? "Fresh" : "Stale";
   const freshnessTone = tab.snapshotFresh ? "success" : "warning";
   const adapterLabel = pageState?.siteAdapterLabel || snapshot?.siteAdapter?.label || "";
@@ -384,6 +400,20 @@ function renderSummary(tab: TrackedTabState | null, snapshot: PageSnapshot | nul
         </div>
       </div>
       <p class="summary-note">${escapeHtml(summaryLine)}</p>
+      ${
+        intervention
+          ? `
+            <div class="intervention-banner intervention-banner--warning">
+              <div class="intervention-banner__copy">
+                <div class="intervention-banner__title">${escapeHtml(intervention.kind === "login" ? "Manual login required" : "Manual payment required")}</div>
+                <div class="intervention-banner__body">${escapeHtml(intervention.message)}</div>
+              </div>
+              <div class="intervention-banner__actions">
+                <button class="btn btn--primary" data-action="resume-user-intervention" type="button">Done</button>
+              </div>
+            </div>`
+          : ""
+      }
       ${tab.snapshotFresh ? "" : `<div class="stale-banner">The page changed after the last scan. Run another scan before approving actions.</div>`}
     </section>
 
@@ -981,6 +1011,8 @@ export class BrowserCompanionApp {
           this.send({ kind: "refresh-tabs" });
         } else if (action === "open-sidepanel") {
           this.send({ kind: "open-sidepanel" });
+        } else if (action === "resume-user-intervention") {
+          this.send({ kind: "resume-user-intervention" });
         } else if (action === "continue-workflow") {
           const nextStep = getActiveWorkflowNextStep(this.state?.workflow ?? null);
           if (nextStep?.request) {
@@ -1086,6 +1118,7 @@ export class BrowserCompanionApp {
       case "page-snapshot":
         if (this.state && this.state.tabs[message.tabId]) {
           const currentTab = this.state.tabs[message.tabId]!;
+          const intervention = resolveUserIntervention(message.snapshot.pageKind);
           const updatedTab: TrackedTabState = {
             tabId: currentTab.tabId,
             windowId: currentTab.windowId,
@@ -1105,6 +1138,8 @@ export class BrowserCompanionApp {
               hasSensitiveInputs: message.snapshot.meta.hasSensitiveInputs,
               siteAdapterId: message.snapshot.siteAdapter?.id ?? null,
               siteAdapterLabel: message.snapshot.siteAdapter?.label ?? null,
+              userInterventionKind: intervention?.kind ?? null,
+              userInterventionMessage: intervention?.message ?? null,
               updatedAt: message.snapshot.capturedAt,
             },
             snapshotFresh: true,
@@ -1117,6 +1152,7 @@ export class BrowserCompanionApp {
           };
           this.state = {
             ...this.state,
+            ...(this.state.activeTabId === message.tabId && intervention ? { status: "awaiting-user" as const } : {}),
             tabs: {
               ...this.state.tabs,
               [message.tabId]: updatedTab,
@@ -1152,9 +1188,12 @@ export class BrowserCompanionApp {
   private renderState(): void {
     const activeTab = this.activeTab();
     const snapshot = this.snapshot();
+    const intervention = getTabIntervention(activeTab);
     this.statusChip.className = `status-chip ${statusClass(this.state?.status ?? "idle")}`;
     this.statusChip.textContent = statusLabel(this.state?.status ?? "idle");
-    this.statusSubline.textContent = activeTab ? `${activeTab.title || "Untitled page"}${activeTab.snapshotFresh ? " - snapshot fresh" : " - snapshot stale"}` : "Waiting for a page.";
+    this.statusSubline.textContent = activeTab
+      ? intervention?.message ?? `${activeTab.title || "Untitled page"}${activeTab.snapshotFresh ? " - snapshot fresh" : " - snapshot stale"}`
+      : "Waiting for a page.";
 
     this.stateRoot.innerHTML = renderPanels(
       activeTab,
@@ -1238,6 +1277,7 @@ export class BrowserCompanionApp {
       | { kind: "reject-action"; approvalId: string }
       | { kind: "refresh-bridge" }
       | { kind: "refresh-semantic" }
+      | { kind: "resume-user-intervention" }
       | { kind: "open-sidepanel" }
       | { kind: "clear-log" }
       | { kind: "scan-page"; mode: "full" | "interactive" | "summary" | "suggestions" },
@@ -1253,6 +1293,20 @@ export class BrowserCompanionApp {
     const value = this.commandInput.value.trim();
     if (!value) {
       this.setFeedback("Type a command before running it.", "warning");
+      return;
+    }
+
+    const activeTab = this.activeTab();
+    const intervention = getTabIntervention(activeTab);
+    if (intervention) {
+      if (isResumeSignal(value)) {
+        this.commandInput.value = "";
+        this.send({ kind: "resume-user-intervention" });
+        this.setFeedback("Resuming after the manual step.", "info");
+        return;
+      }
+
+      this.setFeedback(intervention.message, "warning");
       return;
     }
 

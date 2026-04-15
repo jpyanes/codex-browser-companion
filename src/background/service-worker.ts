@@ -14,6 +14,7 @@ import {
   describeAction,
   isBlockedSensitiveAction,
   requiresApproval,
+  requiresManualIntervention,
 } from "../shared/action-policy";
 import { refreshBridgeState } from "./bridge-client";
 import { createDisabledSemanticState, updateSemanticStateWithObservation } from "../shared/semantic";
@@ -21,6 +22,7 @@ import { buildSemanticSuggestions } from "../shared/semantic";
 import {
   buildWorkflowSuggestions,
   createInitialWorkflowState,
+  getActiveWorkflowNextRequest,
   markWorkflowRequestCompleted,
   markWorkflowRequestFailed,
   markWorkflowStepCompleted,
@@ -32,7 +34,7 @@ import {
 } from "../shared/workflow";
 import { summarizeTrackedTab } from "../shared/tab-orchestration";
 import { requestSemanticObservation, refreshSemanticState } from "./semantic-client";
-import { resolvePageStateFromSnapshot } from "../shared/dom";
+import { resolvePageStateFromSnapshot, resolveUserIntervention } from "../shared/dom";
 import { createActivityLogEntry, normalizeError, nowIso } from "../shared/logger";
 import { isContentEvent, isUiRequest, type ContentRequest, type ContentResponse, type UiEvent, type UiRequest } from "../shared/messages";
 import { readSessionValue, writeSessionValue } from "../shared/storage";
@@ -174,23 +176,44 @@ function deriveStatus(): AssistantConnectionState {
     return "idle";
   }
 
-  if (active.lastError) {
-    return "error";
-  }
-
   if (active.busy) {
     return "running";
+  }
+
+  if (getManualIntervention(active)) {
+    return "awaiting-user";
+  }
+
+  if (active.lastError) {
+    return "error";
   }
 
   if (active.approvals.some((approval) => approval.status === "pending" || approval.status === "executing")) {
     return "awaiting-approval";
   }
 
-  if (active.contentReady) {
-    return "connected";
+  return active.contentReady ? "connected" : "idle";
+}
+
+function getManualIntervention(tab: TrackedTabState | null): { kind: "login" | "payment"; message: string } | null {
+  if (!tab) {
+    return null;
   }
 
-  return "idle";
+  const pageIntervention = resolveUserIntervention(tab.pageState?.userInterventionKind ?? tab.pageState?.pageKind ?? null);
+  if (pageIntervention) {
+    return pageIntervention;
+  }
+
+  if (!requiresManualIntervention(tab.snapshot)) {
+    return null;
+  }
+
+  return resolveUserIntervention(tab.snapshot?.pageKind ?? null);
+}
+
+function isAwaitingUserIntervention(tab: TrackedTabState | null): boolean {
+  return Boolean(getManualIntervention(tab));
 }
 
 async function persistState(): Promise<void> {
@@ -243,6 +266,9 @@ function updateBadge(): void {
   if (active?.busy) {
     text = "RUN";
     color = "#0f766e";
+  } else if (isAwaitingUserIntervention(active)) {
+    text = "WAIT";
+    color = "#ca8a04";
   } else if (approvalCount > 0) {
     text = approvalCount > 99 ? "99+" : String(approvalCount);
     color = "#c2410c";
@@ -411,6 +437,14 @@ function pushLog(tabId: number, level: "debug" | "info" | "success" | "warning" 
     activityLog: truncateEntries([...current.activityLog, entry], MAX_ACTIVITY_LOG_ENTRIES),
     lastSeenAt: nowIso(),
   }));
+}
+
+function logManualInterventionTransition(tabId: number, previousKind: "login" | "payment" | null | undefined, pageState: PageStateBasic): void {
+  if (!pageState.userInterventionKind || pageState.userInterventionKind === previousKind) {
+    return;
+  }
+
+  pushLog(tabId, "warning", `Manual ${pageState.userInterventionKind} step detected.`, pageState.userInterventionMessage ?? "Please complete the step manually, then type done to continue.");
 }
 
 function markBusy(tabId: number, busy: boolean): void {
@@ -640,6 +674,7 @@ async function capturePageFromTab(tabId: number, mode: ScanMode): Promise<PageSn
 async function recordSnapshot(tabId: number, mode: ScanMode): Promise<PageSnapshot> {
   const snapshot = await capturePageFromTab(tabId, mode);
   const pageState = resolvePageStateFromSnapshot(snapshot);
+  const previousInterventionKind = getTabState(tabId).pageState?.userInterventionKind;
   replaceTabState(tabId, (current) => ({
     ...current,
     snapshot,
@@ -649,6 +684,7 @@ async function recordSnapshot(tabId: number, mode: ScanMode): Promise<PageSnapsh
     lastError: null,
     lastSeenAt: nowIso(),
   }));
+  logManualInterventionTransition(tabId, previousInterventionKind, pageState);
   state.workflow = recordWorkflowPageState(state.workflow, tabId, pageState, snapshot);
   pushLog(tabId, "success", `Captured ${mode} page snapshot.`, `Interactive controls: ${snapshot.interactiveElements.length}`);
   commit({ kind: "page-snapshot", tabId, snapshot });
@@ -752,8 +788,14 @@ async function queueActionForApproval(action: ActionRequest): Promise<void> {
   const tabState = getTabState(tabId);
   const snapshot = tabState.snapshot;
 
+  if (isAwaitingUserIntervention(tabState)) {
+    const intervention = getManualIntervention(tabState);
+    pushLog(tabId, "warning", "Paused for a manual browser step.", intervention?.message ?? "Complete the login or payment step manually, then type done to continue.");
+    commit();
+    return;
+  }
+
   if (isBlockedSensitiveAction(action, snapshot)) {
-    state.workflow = markWorkflowStepFailed(state.workflow, action, "Sensitive fields are not supported in v1.");
     const error = normalizeError("Sensitive form fields are not supported in v1.", "SENSITIVE_FIELD_BLOCKED", {
       tabId,
       recoverable: true,
@@ -781,6 +823,13 @@ async function queueActionForApproval(action: ActionRequest): Promise<void> {
 async function executeApprovedAction(tabId: number, action: ActionRequest, approvalId?: string): Promise<void> {
   const tabState = getTabState(tabId);
   const snapshot = tabState.snapshot;
+
+  if (isAwaitingUserIntervention(tabState)) {
+    const intervention = getManualIntervention(tabState);
+    pushLog(tabId, "warning", "Paused for a manual browser step.", intervention?.message ?? "Complete the login or payment step manually, then type done to continue.");
+    commit();
+    return;
+  }
 
   if (requiresApproval(action)) {
     // Safety net: queued actions must not reach execution without approval.
@@ -915,6 +964,30 @@ async function rejectAction(approvalId: string): Promise<void> {
   commit({ kind: "approval-updated", approval: updated });
 }
 
+async function resumeManualIntervention(): Promise<void> {
+  const tabId = state.activeTabId;
+  if (tabId === null) {
+    return;
+  }
+
+  await syncActiveTab(tabId);
+  pushLog(tabId, "info", "Manual step completed.", "Rescanning the current page and resuming the workflow.");
+  await scanActiveTab("suggestions");
+
+  const tabState = getTabState(tabId);
+  const intervention = getManualIntervention(tabState);
+  if (intervention) {
+    pushLog(tabId, "warning", "Manual step is still pending.", intervention.message);
+    commit();
+    return;
+  }
+
+  const nextRequest = state.workflow.activeWorkflow ? getActiveWorkflowNextRequest(state.workflow) : null;
+  if (nextRequest?.kind === "request-action") {
+    await queueActionForApproval(nextRequest.action);
+  }
+}
+
 async function openSidePanel(): Promise<void> {
   const tabId = state.activeTabId;
   if (tabId === null || !chrome.sidePanel) {
@@ -1044,6 +1117,9 @@ async function handleUiRequest(port: chrome.runtime.Port, request: UiRequest): P
     case "refresh-semantic":
       await refreshSemanticStatus();
       return;
+    case "resume-user-intervention":
+      await resumeManualIntervention();
+      return;
     case "open-sidepanel":
       await openSidePanel();
       return;
@@ -1069,6 +1145,7 @@ async function handleContentEvent(message: unknown, sender: chrome.runtime.Messa
 
   switch (message.kind) {
     case "page-state": {
+      const previousInterventionKind = getTabState(tabId).pageState?.userInterventionKind;
       const nextState: PageStateBasic = {
         ...message.state,
         url: message.state.url,
@@ -1086,6 +1163,7 @@ async function handleContentEvent(message: unknown, sender: chrome.runtime.Messa
         lastError: null,
         lastSeenAt: nowIso(),
       }));
+      logManualInterventionTransition(tabId, previousInterventionKind, nextState);
       state.workflow = recordWorkflowPageState(state.workflow, tabId, nextState, null);
       commit();
       return;

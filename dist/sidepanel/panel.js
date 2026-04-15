@@ -69,7 +69,7 @@
     return action.kind === "click" || action.kind === "type" || action.kind === "select" || action.kind === "submit-form";
   }
   function isLikelySensitiveSnapshot(snapshot) {
-    return Boolean(snapshot?.meta.hasSensitiveInputs || snapshot?.pageKind === "login");
+    return Boolean(snapshot?.meta.hasSensitiveInputs || snapshot?.pageKind === "login" || snapshot?.pageKind === "payment");
   }
   function classifyDanger(action, snapshot) {
     if (action.kind === "submit-form") {
@@ -163,6 +163,9 @@
     });
   }
   function tabStatusTone(tab, activeTabId) {
+    if (tab.pageState?.userInterventionKind || tab.pageState?.pageKind === "login" || tab.pageState?.pageKind === "payment") {
+      return "warning";
+    }
     if (tab.lastError) {
       return "danger";
     }
@@ -181,6 +184,9 @@
     return "success";
   }
   function tabStatusLabel(tab, activeTabId) {
+    if (tab.pageState?.userInterventionKind || tab.pageState?.pageKind === "login" || tab.pageState?.pageKind === "payment") {
+      return tab.tabId === activeTabId ? "Waiting for you" : "User action needed";
+    }
     if (tab.lastError) {
       return "Error";
     }
@@ -214,6 +220,9 @@
       pieces.push(`${tab.pageState.pageKind}`);
       if (tab.pageState.siteAdapterLabel) {
         pieces.push(tab.pageState.siteAdapterLabel);
+      }
+      if (tab.pageState.userInterventionKind) {
+        pieces.push(`waiting for ${tab.pageState.userInterventionKind}`);
       }
       pieces.push(`${tab.pageState.interactiveCount} interactive`);
     }
@@ -289,6 +298,23 @@
       }
       return left.tab.lastSeenAt < right.tab.lastSeenAt ? 1 : -1;
     });
+  }
+
+  // src/shared/dom.ts
+  function resolveUserIntervention(pageKind) {
+    if (pageKind === "login") {
+      return {
+        kind: "login",
+        message: "Login page detected. Please sign in manually, then type done to continue."
+      };
+    }
+    if (pageKind === "payment") {
+      return {
+        kind: "payment",
+        message: "Payment page detected. Please complete the payment manually, then type done to continue."
+      };
+    }
+    return null;
   }
 
   // src/shared/instructions.ts
@@ -965,6 +991,8 @@
         return "Running";
       case "awaiting-approval":
         return "Awaiting approval";
+      case "awaiting-user":
+        return "Waiting for you";
       case "error":
         return "Error";
     }
@@ -977,6 +1005,15 @@
   }
   function getPageState(tab) {
     return tab?.snapshot ?? null;
+  }
+  function getTabIntervention(tab) {
+    if (!tab) {
+      return null;
+    }
+    return resolveUserIntervention(tab.pageState?.userInterventionKind ?? tab.pageState?.pageKind ?? tab.snapshot?.pageKind ?? null);
+  }
+  function isResumeSignal(input) {
+    return /^(done|i'?m done|im done|finished|complete|resume|continue)[.!]?$/i.test(input.trim());
   }
   function renderChip(label, tone = "neutral") {
     return `<span class="chip chip--${tone}">${escapeHtml(label)}</span>`;
@@ -1103,6 +1140,7 @@
       return `<section class="panel panel--empty"><p class="empty">No active tab detected. Open a web page and reopen the extension.</p></section>`;
     }
     const pageState = tab.pageState;
+    const intervention = getTabIntervention(tab);
     const freshState = tab.snapshotFresh ? "Fresh" : "Stale";
     const freshnessTone = tab.snapshotFresh ? "success" : "warning";
     const adapterLabel = pageState?.siteAdapterLabel || snapshot?.siteAdapter?.label || "";
@@ -1159,6 +1197,16 @@
         </div>
       </div>
       <p class="summary-note">${escapeHtml(summaryLine)}</p>
+      ${intervention ? `
+            <div class="intervention-banner intervention-banner--warning">
+              <div class="intervention-banner__copy">
+                <div class="intervention-banner__title">${escapeHtml(intervention.kind === "login" ? "Manual login required" : "Manual payment required")}</div>
+                <div class="intervention-banner__body">${escapeHtml(intervention.message)}</div>
+              </div>
+              <div class="intervention-banner__actions">
+                <button class="btn btn--primary" data-action="resume-user-intervention" type="button">Done</button>
+              </div>
+            </div>` : ""}
       ${tab.snapshotFresh ? "" : `<div class="stale-banner">The page changed after the last scan. Run another scan before approving actions.</div>`}
     </section>
 
@@ -1648,6 +1696,8 @@
             this.send({ kind: "refresh-tabs" });
           } else if (action === "open-sidepanel") {
             this.send({ kind: "open-sidepanel" });
+          } else if (action === "resume-user-intervention") {
+            this.send({ kind: "resume-user-intervention" });
           } else if (action === "continue-workflow") {
             const nextStep = getActiveWorkflowNextStep(this.state?.workflow ?? null);
             if (nextStep?.request) {
@@ -1740,6 +1790,7 @@
         case "page-snapshot":
           if (this.state && this.state.tabs[message.tabId]) {
             const currentTab = this.state.tabs[message.tabId];
+            const intervention = resolveUserIntervention(message.snapshot.pageKind);
             const updatedTab = {
               tabId: currentTab.tabId,
               windowId: currentTab.windowId,
@@ -1759,6 +1810,8 @@
                 hasSensitiveInputs: message.snapshot.meta.hasSensitiveInputs,
                 siteAdapterId: message.snapshot.siteAdapter?.id ?? null,
                 siteAdapterLabel: message.snapshot.siteAdapter?.label ?? null,
+                userInterventionKind: intervention?.kind ?? null,
+                userInterventionMessage: intervention?.message ?? null,
                 updatedAt: message.snapshot.capturedAt
               },
               snapshotFresh: true,
@@ -1771,6 +1824,7 @@
             };
             this.state = {
               ...this.state,
+              ...this.state.activeTabId === message.tabId && intervention ? { status: "awaiting-user" } : {},
               tabs: {
                 ...this.state.tabs,
                 [message.tabId]: updatedTab
@@ -1802,9 +1856,10 @@
     renderState() {
       const activeTab = this.activeTab();
       const snapshot = this.snapshot();
+      const intervention = getTabIntervention(activeTab);
       this.statusChip.className = `status-chip ${statusClass(this.state?.status ?? "idle")}`;
       this.statusChip.textContent = statusLabel(this.state?.status ?? "idle");
-      this.statusSubline.textContent = activeTab ? `${activeTab.title || "Untitled page"}${activeTab.snapshotFresh ? " - snapshot fresh" : " - snapshot stale"}` : "Waiting for a page.";
+      this.statusSubline.textContent = activeTab ? intervention?.message ?? `${activeTab.title || "Untitled page"}${activeTab.snapshotFresh ? " - snapshot fresh" : " - snapshot stale"}` : "Waiting for a page.";
       this.stateRoot.innerHTML = renderPanels(
         activeTab,
         snapshot,
@@ -1881,6 +1936,18 @@
         this.setFeedback("Type a command before running it.", "warning");
         return;
       }
+      const activeTab = this.activeTab();
+      const intervention = getTabIntervention(activeTab);
+      if (intervention) {
+        if (isResumeSignal(value)) {
+          this.commandInput.value = "";
+          this.send({ kind: "resume-user-intervention" });
+          this.setFeedback("Resuming after the manual step.", "info");
+          return;
+        }
+        this.setFeedback(intervention.message, "warning");
+        return;
+      }
       const preview = buildWorkflowPlanFromInstruction(value, this.snapshot(), this.state?.workflow?.activeWorkflow ?? null);
       if (!preview) {
         this.setFeedback("Could not parse that command. Try: click save, type hello into search, scroll down 600, summarize page.", "error");
@@ -1896,9 +1963,9 @@
       if (preview.primaryRequest) {
         const request = preview.primaryRequest;
         if (request.kind === "request-action") {
-          const activeTab = this.activeTab();
-          if (activeTab) {
-            request.action.tabId = activeTab.tabId;
+          const activeTab2 = this.activeTab();
+          if (activeTab2) {
+            request.action.tabId = activeTab2.tabId;
           }
         }
         window.setTimeout(() => {

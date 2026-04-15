@@ -36,12 +36,36 @@ describe("tab orchestration helpers", () => {
 
   it("describes tab status consistently for orchestration cards", () => {
     const current = makeTab({ tabId: 1, active: true, contentReady: true, snapshotFresh: true });
+    const awaitingUser = makeTab({
+      tabId: 5,
+      active: true,
+      contentReady: true,
+      snapshotFresh: true,
+      pageState: {
+        url: "https://example.com/login",
+        title: "Sign in",
+        readyState: "complete",
+        navigationMode: "document",
+        pageKind: "login",
+        interactiveCount: 2,
+        formCount: 1,
+        visibleTextLength: 100,
+        hasSensitiveInputs: true,
+        siteAdapterId: null,
+        siteAdapterLabel: null,
+        userInterventionKind: "login",
+        userInterventionMessage: "Login page detected. Please sign in manually, then type done to continue.",
+        updatedAt: nowIso(),
+      },
+    });
     const stale = makeTab({ tabId: 2, contentReady: true, snapshotFresh: false });
     const detached = makeTab({ tabId: 3, contentReady: false, snapshotFresh: false });
     const errored = makeTab({ tabId: 4, lastError: { code: "TAB_ERROR", message: "Broken", details: undefined, recoverable: true, tabId: 4, occurredAt: nowIso() } });
 
     expect(tabStatusLabel(current, 1)).toBe("Current");
     expect(tabStatusTone(current, 1)).toBe("success");
+    expect(tabStatusLabel(awaitingUser, 1)).toBe("User action needed");
+    expect(tabStatusTone(awaitingUser, 1)).toBe("warning");
     expect(tabStatusLabel(stale, 1)).toBe("Stale");
     expect(tabStatusTone(stale, 1)).toBe("warning");
     expect(tabStatusLabel(detached, 1)).toBe("Detached");

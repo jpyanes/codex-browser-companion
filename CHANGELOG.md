@@ -11,6 +11,7 @@ All notable changes to this project are documented in this file.
 - Added an optional Stagehand-backed semantic bridge on `localhost:19989` that enriches suggested actions when a model is configured.
 - Added workflow planner and memory support for compound commands, blocked-step tracking, workflow history, and a workflow panel with continue/resume behavior.
 - Added multi-tab orchestration with a refreshable tab inventory, explicit focus controls, and scan/summary actions per tracked tab.
+- Added a manual handoff state for login and payment pages that pauses browser actions, shows a visible banner, and resumes on `done`.
 
 ## [0.1.0] - 2026-04-14
 
