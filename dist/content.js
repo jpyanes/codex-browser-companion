@@ -78,6 +78,40 @@
     return "low";
   }
 
+  // src/shared/tab-context.ts
+  function buildTabContextFromSnapshot(snapshot) {
+    return {
+      tabId: snapshot.tabId,
+      windowId: null,
+      url: snapshot.url,
+      title: snapshot.title,
+      pageKind: snapshot.pageKind,
+      siteAdapterId: snapshot.siteAdapter?.id ?? null,
+      siteAdapterLabel: snapshot.siteAdapter?.label ?? null,
+      snapshotId: snapshot.snapshotId,
+      capturedAt: snapshot.capturedAt
+    };
+  }
+  function attachTabContextToAction(action, tabContext) {
+    return {
+      ...action,
+      tabContext
+    };
+  }
+  function attachTabContextToRequest(request, tabContext) {
+    if (request.kind === "request-action") {
+      return {
+        ...request,
+        tabContext,
+        action: attachTabContextToAction(request.action, tabContext)
+      };
+    }
+    return {
+      ...request,
+      tabContext
+    };
+  }
+
   // src/shared/site-adapters.ts
   function normalize(input) {
     return input.trim().replace(/\s+/g, " ").toLowerCase();
@@ -101,34 +135,33 @@
     return null;
   }
   function buildClickSuggestion(snapshot, element, title, description) {
+    const tabContext = buildTabContextFromSnapshot(snapshot);
+    const action = attachTabContextToAction(
+      {
+        actionId: makeSuggestionId("action"),
+        tabId: snapshot.tabId,
+        kind: "click",
+        elementId: element.elementId,
+        label: element.label || element.text || title,
+        selector: element.selector
+      },
+      tabContext
+    );
     return {
       id: makeSuggestionId(`site-${snapshot.snapshotId}`),
       title,
       description,
       buttonLabel: "Queue",
-      request: {
-        kind: "request-action",
-        action: {
-          actionId: makeSuggestionId("action"),
-          tabId: snapshot.tabId,
-          kind: "click",
-          elementId: element.elementId,
-          label: element.label || element.text || title,
-          selector: element.selector
-        }
-      },
-      approvalRequired: true,
-      dangerLevel: classifyDanger(
+      tabContext,
+      request: attachTabContextToRequest(
         {
-          actionId: "preview",
-          tabId: snapshot.tabId,
-          kind: "click",
-          elementId: element.elementId,
-          label: element.label || element.text || title,
-          selector: element.selector
+          kind: "request-action",
+          action
         },
-        snapshot
+        tabContext
       ),
+      approvalRequired: true,
+      dangerLevel: classifyDanger(action, snapshot),
       source: "site",
       selector: element.selector,
       confidence: 0.9
@@ -736,76 +769,218 @@
     }
     return parts.join(" ");
   }
-  function buildSuggestedActions(snapshot) {
-    const suggestions = [
-      {
-        id: "summarize-page",
-        title: "Summarize page",
-        description: "Generate a concise summary of the current page.",
-        buttonLabel: "Summarize",
-        request: { kind: "scan-page", mode: "summary" },
-        approvalRequired: false,
-        dangerLevel: "low",
-        source: "dom",
-        selector: void 0,
-        confidence: void 0
-      },
-      {
-        id: "list-interactive-elements",
-        title: "List interactive elements",
-        description: "Inspect visible buttons, links, inputs, and other controls.",
-        buttonLabel: "Inspect",
-        request: { kind: "scan-page", mode: "interactive" },
-        approvalRequired: false,
-        dangerLevel: "low",
-        source: "dom",
-        selector: void 0,
-        confidence: void 0
+  function makeSuggestedActionId(prefix) {
+    return globalThis.crypto?.randomUUID?.() ?? `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  }
+  function suggestionSignature(suggestion) {
+    const contextKey = `${suggestion.tabContext.tabId}:${suggestion.tabContext.snapshotId ?? ""}`;
+    if (suggestion.request.kind === "request-action") {
+      const action = suggestion.request.action;
+      const elementKey = "elementId" in action ? action.elementId : "";
+      const labelKey = "label" in action ? action.label ?? "" : "";
+      return [
+        "action",
+        contextKey,
+        action.kind,
+        action.selector ?? elementKey,
+        labelKey,
+        action.workflowId ?? "",
+        action.workflowStepId ?? ""
+      ].join(":");
+    }
+    return [
+      "scan",
+      contextKey,
+      suggestion.request.kind,
+      suggestion.request.kind === "scan-page" ? suggestion.request.mode : "",
+      suggestion.request.workflowId ?? "",
+      suggestion.request.workflowStepId ?? ""
+    ].join(":");
+  }
+  function dedupeSuggestedActions(suggestions) {
+    const seen = /* @__PURE__ */ new Set();
+    const deduped = [];
+    for (const suggestion of suggestions) {
+      const signature = suggestionSignature(suggestion);
+      if (seen.has(signature)) {
+        continue;
       }
-    ];
+      seen.add(signature);
+      deduped.push(suggestion);
+    }
+    return deduped;
+  }
+  function buildTabScopedScanSuggestion(snapshot, tabContext, id, title, description, mode, buttonLabel) {
+    return {
+      id,
+      title,
+      description,
+      buttonLabel,
+      tabContext,
+      request: attachTabContextToRequest({ kind: "scan-page", mode }, tabContext),
+      approvalRequired: false,
+      dangerLevel: "low",
+      source: "dom",
+      selector: void 0,
+      confidence: void 0
+    };
+  }
+  function scorePrimaryActionCandidate(element, pageKind) {
+    if (element.isSensitive || element.disabled) {
+      return -1;
+    }
+    const tagName = element.tagName.toLowerCase();
+    const haystack = normalizeComparable(
+      [element.label, element.text, element.name ?? "", element.placeholder ?? "", element.selector, element.role, element.type ?? ""].filter(Boolean).join(" ")
+    );
+    if (/\b(delete|remove|unsubscribe|cancel account|sign out|log out|purchase|pay|checkout|publish|post)\b/.test(haystack)) {
+      return -1;
+    }
+    let score = 0;
+    if (tagName === "button") {
+      score += 25;
+    } else if (tagName === "a") {
+      score += 20;
+    } else if (tagName === "summary") {
+      score += 15;
+    } else if (element.role.toLowerCase().includes("button")) {
+      score += 18;
+    }
+    if (element.formAssociated) {
+      score += 4;
+    }
+    if (element.contentEditable) {
+      score += 6;
+    }
+    if (element.type === "submit") {
+      score += 8;
+    }
+    if (/\b(continue|next|open|new|compose|reply|create|start|save|search|view|edit|more|details|expand|open menu)\b/.test(haystack)) {
+      score += 35;
+    }
+    if (/\b(like|react|follow|accept|approve|confirm|details)\b/.test(haystack)) {
+      score += 16;
+    }
+    if (pageKind === "article" && /\b(read more|continue reading|more)\b/.test(haystack)) {
+      score += 8;
+    }
+    if (pageKind === "spa" && /\b(refresh|reload|update)\b/.test(haystack)) {
+      score += 10;
+    }
+    return score;
+  }
+  function buildPrimaryActionSuggestion(snapshot, tabContext) {
+    if (snapshot.pageKind === "login" || snapshot.pageKind === "payment") {
+      return null;
+    }
+    let bestElement = null;
+    let bestScore = 0;
+    for (const element of snapshot.interactiveElements) {
+      const score = scorePrimaryActionCandidate(element, snapshot.pageKind);
+      if (score > bestScore) {
+        bestScore = score;
+        bestElement = element;
+      }
+    }
+    if (!bestElement || bestScore < 45) {
+      return null;
+    }
+    const label = bestElement.label || bestElement.text || bestElement.placeholder || bestElement.name || "the highlighted control";
+    const action = attachTabContextToAction(
+      {
+        actionId: makeSuggestedActionId("action"),
+        tabId: snapshot.tabId,
+        kind: "click",
+        elementId: bestElement.elementId,
+        label,
+        selector: bestElement.selector
+      },
+      tabContext
+    );
+    return {
+      id: `primary-action-${snapshot.snapshotId}-${bestElement.elementId}`,
+      title: `Click ${label}`,
+      description: `Use the most relevant visible control on ${snapshot.title || "the current page"} after reviewing the page context.`,
+      buttonLabel: "Queue",
+      tabContext,
+      request: attachTabContextToRequest({ kind: "request-action", action }, tabContext),
+      approvalRequired: true,
+      dangerLevel: classifyDanger(action, snapshot),
+      source: "dom",
+      selector: bestElement.selector,
+      confidence: Math.min(0.95, 0.5 + bestScore / 100)
+    };
+  }
+  function buildNextActionSuggestions(snapshot) {
+    const tabContext = buildTabContextFromSnapshot(snapshot);
+    const suggestions = [];
+    const primarySuggestion = buildPrimaryActionSuggestion(snapshot, tabContext);
+    if (primarySuggestion) {
+      suggestions.push(primarySuggestion);
+    }
+    suggestions.push(
+      buildTabScopedScanSuggestion(
+        snapshot,
+        tabContext,
+        "summarize-page",
+        "Summarize page",
+        "Generate a concise summary of the current page.",
+        "summary",
+        "Summarize"
+      ),
+      buildTabScopedScanSuggestion(
+        snapshot,
+        tabContext,
+        "list-interactive-elements",
+        "List interactive elements",
+        "Inspect visible buttons, links, inputs, and other controls.",
+        "interactive",
+        "Inspect"
+      )
+    );
     if (snapshot.pageKind === "article") {
-      suggestions.push({
-        id: "article-review",
-        title: "Review article structure",
-        description: "Use the heading outline to move through the page in sections.",
-        buttonLabel: "Review",
-        request: { kind: "scan-page", mode: "summary" },
-        approvalRequired: false,
-        dangerLevel: "low",
-        source: "dom",
-        selector: void 0,
-        confidence: void 0
-      });
+      suggestions.push(
+        buildTabScopedScanSuggestion(
+          snapshot,
+          tabContext,
+          "article-review",
+          "Review article structure",
+          "Use the heading outline to move through the page in sections.",
+          "summary",
+          "Review"
+        )
+      );
     }
     if (snapshot.pageKind === "form" || snapshot.pageKind === "login") {
-      suggestions.push({
-        id: "form-review",
-        title: "Review form controls",
-        description: "Inspect the form fields before typing or submitting anything.",
-        buttonLabel: "Review",
-        request: { kind: "scan-page", mode: "interactive" },
-        approvalRequired: false,
-        dangerLevel: "low",
-        source: "dom",
-        selector: void 0,
-        confidence: void 0
-      });
+      suggestions.push(
+        buildTabScopedScanSuggestion(
+          snapshot,
+          tabContext,
+          "form-review",
+          "Review form controls",
+          "Inspect the form fields before typing or submitting anything.",
+          "interactive",
+          "Review"
+        )
+      );
     }
     if (snapshot.pageKind === "spa") {
-      suggestions.push({
-        id: "spa-rescan",
-        title: "Rescan after route changes",
-        description: "Single-page apps often mutate the page without a full reload.",
-        buttonLabel: "Rescan",
-        request: { kind: "scan-page", mode: "full" },
-        approvalRequired: false,
-        dangerLevel: "low",
-        source: "dom",
-        selector: void 0,
-        confidence: void 0
-      });
+      suggestions.push(
+        buildTabScopedScanSuggestion(
+          snapshot,
+          tabContext,
+          "spa-rescan",
+          "Rescan after route changes",
+          "Single-page apps often mutate the page without a full reload.",
+          "full",
+          "Rescan"
+        )
+      );
     }
-    return suggestions.slice(0, 4);
+    return dedupeSuggestedActions(suggestions).slice(0, 5);
+  }
+  function buildSuggestedActions(snapshot) {
+    return buildNextActionSuggestions(snapshot);
   }
   function capturePageState(document2, navigationMode) {
     const registry = createRegistryHandle();
@@ -945,14 +1120,16 @@
     const snapshot = {
       ...snapshotBase,
       summary: summarizePageState(completedState, headings, forms, interactiveElements.length, siteResolution.siteAdapter),
-      suggestedActions: buildSuggestedActions({
-        ...snapshotBase,
-        siteAdapter: siteResolution.siteAdapter,
-        summary: "",
-        suggestedActions: []
-      })
+      suggestedActions: dedupeSuggestedActions([
+        ...buildSuggestedActions({
+          ...snapshotBase,
+          siteAdapter: siteResolution.siteAdapter,
+          summary: "",
+          suggestedActions: []
+        }),
+        ...siteResolution.suggestions
+      ])
     };
-    snapshot.suggestedActions = [...snapshot.suggestedActions, ...siteResolution.suggestions];
     return { snapshot, registry: registry.registry };
   }
   function createActionResult(action, tabId, success, message, details, approvalId) {

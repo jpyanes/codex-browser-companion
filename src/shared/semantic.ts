@@ -1,6 +1,7 @@
 import { DEFAULT_SEMANTIC_ENDPOINT } from "./constants";
 import { classifyDanger } from "./action-policy";
 import { normalizeError, nowIso } from "./logger";
+import { attachTabContextToAction, attachTabContextToRequest, buildTabContextFromSnapshot } from "./tab-context";
 import type {
   AppError,
   PageSnapshot,
@@ -185,21 +186,23 @@ export async function buildSemanticSuggestions(
       continue;
     }
 
-    const actionRequest = {
+    const tabContext = buildTabContextFromSnapshot(snapshot);
+    const actionRequest = attachTabContextToAction({
       actionId: globalThis.crypto?.randomUUID?.() ?? `action_${Date.now()}_${Math.random().toString(16).slice(2)}`,
       tabId: snapshot.tabId,
       kind: "click" as const,
       elementId: resolved.elementId,
       label: resolved.label || action.description || selector,
       selector,
-    };
+    }, tabContext);
 
     suggestions.push({
       id: `stagehand-${snapshot.snapshotId}-${index}`,
       title: action.description || resolved.label || "Semantic click target",
       description: `Stagehand suggested ${action.description || "a click action"}.`,
       buttonLabel: "Queue",
-      request: { kind: "request-action", action: actionRequest },
+      tabContext,
+      request: attachTabContextToRequest({ kind: "request-action", action: actionRequest }, tabContext),
       approvalRequired: true,
       dangerLevel: classifyDanger(actionRequest, snapshot),
       source: "stagehand",
@@ -282,4 +285,3 @@ export function normalizeSemanticObservation(value: unknown, fallbackEndpoint = 
     actions,
   };
 }
-

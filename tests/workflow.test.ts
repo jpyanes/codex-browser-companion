@@ -44,11 +44,13 @@ describe("workflow planner and memory", () => {
       expect(preview.primaryRequest.action.kind).toBe("click");
       expect(preview.primaryRequest.action.workflowId).toBe(preview.workflow.workflowId);
       expect(preview.primaryRequest.action.workflowStepId).toBe(preview.workflow.steps[0]?.stepId);
+      expect(preview.primaryRequest.action.tabContext?.tabId).toBe(snapshot.tabId);
     }
 
     expect(preview?.workflow.steps[1]?.request?.kind).toBe("scan-page");
     if (preview?.workflow.steps[1]?.request?.kind === "scan-page") {
       expect(preview.workflow.steps[1].request.mode).toBe("summary");
+      expect(preview.workflow.steps[1].request.tabContext?.tabId).toBe(snapshot.tabId);
     }
   });
 
@@ -100,5 +102,6 @@ describe("workflow planner and memory", () => {
     const suggestions = buildWorkflowSuggestions(state, movedSnapshot);
     expect(suggestions.some((item) => item.source === "workflow" && item.id.startsWith("workflow-rescan-"))).toBe(true);
     expect(suggestions.some((item) => item.source === "workflow" && item.request.kind === "scan-page")).toBe(true);
+    expect(suggestions.every((item) => item.tabContext.tabId === movedSnapshot.tabId)).toBe(true);
   });
 });

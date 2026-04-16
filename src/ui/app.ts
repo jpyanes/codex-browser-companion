@@ -2,9 +2,11 @@ import { DEFAULT_UI_POLL_MS } from "../shared/constants";
 import { bridgeStatusLabel, bridgeStatusTone, summarizeBridgeState } from "../shared/bridge";
 import { normalizeError, nowIso } from "../shared/logger";
 import { semanticStatusLabel, semanticStatusTone, summarizeSemanticState } from "../shared/semantic";
+import { buildTabContextFromTrackedTab, formatTabContext } from "../shared/tab-context";
 import { sortTrackedTabs, summarizeTrackedTab, tabStatusLabel, tabStatusTone } from "../shared/tab-orchestration";
 import { searchTrackedTabs } from "../shared/tab-intelligence";
 import { resolveUserIntervention } from "../shared/dom";
+import type { UiRequest } from "../shared/messages";
 import {
   buildWorkflowPlanFromInstruction,
   getActiveWorkflowNextStep,
@@ -268,6 +270,7 @@ function renderSuggestionCard(suggestion: SuggestedAction): string {
         </div>
       </div>
       <div class="suggestion__description">${escapeHtml(suggestion.description)}</div>
+      <div class="suggestion__context">${escapeHtml(`On ${formatTabContext(suggestion.tabContext)}`)}</div>
       ${
         suggestion.selector
           ? `<div class="suggestion__selector">${escapeHtml(suggestion.selector)}</div>`
@@ -1267,26 +1270,43 @@ export class BrowserCompanionApp {
     }
   }
 
-  private send(
-    request:
-      | SuggestedRequest
-      | { kind: "refresh-tabs" }
-      | { kind: "focus-tab"; tabId: number }
-      | { kind: "scan-tab"; tabId: number; mode: "full" | "interactive" | "summary" | "suggestions" }
-      | { kind: "approve-action"; approvalId: string }
-      | { kind: "reject-action"; approvalId: string }
-      | { kind: "refresh-bridge" }
-      | { kind: "refresh-semantic" }
-      | { kind: "resume-user-intervention" }
-      | { kind: "open-sidepanel" }
-      | { kind: "clear-log" }
-      | { kind: "scan-page"; mode: "full" | "interactive" | "summary" | "suggestions" },
-  ): void {
-    this.port?.postMessage(request);
+  private attachTabContext<T extends UiRequest | SuggestedRequest>(request: T): T {
+    const activeTab = this.activeTab();
+    const activeContext = activeTab ? buildTabContextFromTrackedTab(activeTab) : null;
+    if (!activeContext) {
+      return request;
+    }
+
+    switch (request.kind) {
+      case "scan-page":
+      case "list-interactive-elements":
+      case "summarize-page":
+      case "suggest-next-actions":
+        return (request.tabContext ? request : { ...request, tabContext: activeContext }) as T;
+      case "request-action": {
+        const context = request.tabContext ?? request.action.tabContext ?? activeContext;
+        const actionTabId = request.action.tabId >= 0 ? request.action.tabId : context.tabId;
+        return {
+          ...request,
+          tabContext: context,
+          action: {
+            ...request.action,
+            tabId: actionTabId,
+            tabContext: context,
+          },
+        } as T;
+      }
+      default:
+        return request;
+    }
+  }
+
+  private send(request: UiRequest | SuggestedRequest): void {
+    this.port?.postMessage(this.attachTabContext(request));
   }
 
   private sendSuggestion(request: SuggestedRequest): void {
-    this.port?.postMessage(request);
+    this.port?.postMessage(this.attachTabContext(request));
   }
 
   private async handleCommandSubmit(): Promise<void> {
@@ -1326,14 +1346,7 @@ export class BrowserCompanionApp {
     }
 
     if (preview.primaryRequest) {
-      const request = preview.primaryRequest;
-      if (request.kind === "request-action") {
-        const activeTab = this.activeTab();
-        if (activeTab) {
-          request.action.tabId = activeTab.tabId;
-        }
-      }
-
+      const request = this.attachTabContext(preview.primaryRequest);
       window.setTimeout(() => {
         this.port?.postMessage(request);
       }, 0);

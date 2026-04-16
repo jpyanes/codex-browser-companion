@@ -91,6 +91,91 @@
     return "low";
   }
 
+  // src/shared/tab-context.ts
+  function buildTabContextFromSnapshot(snapshot) {
+    return {
+      tabId: snapshot.tabId,
+      windowId: null,
+      url: snapshot.url,
+      title: snapshot.title,
+      pageKind: snapshot.pageKind,
+      siteAdapterId: snapshot.siteAdapter?.id ?? null,
+      siteAdapterLabel: snapshot.siteAdapter?.label ?? null,
+      snapshotId: snapshot.snapshotId,
+      capturedAt: snapshot.capturedAt
+    };
+  }
+  function buildTabContextFromPageState(tabId, pageState) {
+    if (!pageState) {
+      return null;
+    }
+    return {
+      tabId,
+      windowId: null,
+      url: pageState.url,
+      title: pageState.title,
+      pageKind: pageState.pageKind,
+      siteAdapterId: pageState.siteAdapterId ?? null,
+      siteAdapterLabel: pageState.siteAdapterLabel ?? null,
+      snapshotId: null,
+      capturedAt: pageState.updatedAt
+    };
+  }
+  function buildTabContextFromTrackedTab(tab) {
+    if (tab.snapshot) {
+      return {
+        ...buildTabContextFromSnapshot(tab.snapshot),
+        windowId: tab.windowId
+      };
+    }
+    const pageStateContext = buildTabContextFromPageState(tab.tabId, tab.pageState);
+    if (pageStateContext) {
+      return {
+        ...pageStateContext,
+        windowId: tab.windowId
+      };
+    }
+    if (!tab.url && !tab.title) {
+      return null;
+    }
+    return {
+      tabId: tab.tabId,
+      windowId: tab.windowId,
+      url: tab.url,
+      title: tab.title,
+      pageKind: "unknown",
+      siteAdapterId: null,
+      siteAdapterLabel: null,
+      snapshotId: null,
+      capturedAt: null
+    };
+  }
+  function describeTabContext(tabContext) {
+    return tabContext.siteAdapterLabel || tabContext.title || tabContext.url || `Tab ${tabContext.tabId}`;
+  }
+  function formatTabContext(tabContext) {
+    return `${describeTabContext(tabContext)} · tab ${tabContext.tabId}`;
+  }
+  function attachTabContextToAction(action, tabContext) {
+    return {
+      ...action,
+      tabContext
+    };
+  }
+  function attachTabContextToRequest(request, tabContext) {
+    if (request.kind === "request-action") {
+      return {
+        ...request,
+        tabContext,
+        action: attachTabContextToAction(request.action, tabContext)
+      };
+    }
+    return {
+      ...request,
+      tabContext
+    };
+  }
+
   // src/shared/semantic.ts
   function semanticStatusTone(status) {
     switch (status) {
@@ -432,6 +517,12 @@
     }
     return null;
   }
+  function withSnapshotTabContext(request, snapshot) {
+    if (!snapshot) {
+      return request;
+    }
+    return attachTabContextToRequest(request, buildTabContextFromSnapshot(snapshot));
+  }
   function parseInstruction(input, snapshot) {
     const trimmed = normalize3(input);
     if (!trimmed) {
@@ -441,28 +532,28 @@
     if (/^(scan|scan page|rescan|capture page)(?:\s+(full|summary|interactive|suggestions))?$/.test(comparable)) {
       const mode = trimmed.match(/\b(full|summary|interactive|suggestions)\b/i)?.[1]?.toLowerCase() ?? "full";
       return {
-        request: { kind: "scan-page", mode },
+        request: withSnapshotTabContext({ kind: "scan-page", mode }, snapshot),
         explanation: `Queue a ${mode} scan of the current page.`,
         confidence: 0.96
       };
     }
     if (/^(summarize|summary)( page)?$/.test(comparable)) {
       return {
-        request: { kind: "scan-page", mode: "summary" },
+        request: withSnapshotTabContext({ kind: "scan-page", mode: "summary" }, snapshot),
         explanation: "Summarize the current page.",
         confidence: 0.98
       };
     }
     if (/^(list|show|inspect) (interactive|controls|elements)( on page)?$/.test(comparable) || comparable === "interactive elements") {
       return {
-        request: { kind: "scan-page", mode: "interactive" },
+        request: withSnapshotTabContext({ kind: "scan-page", mode: "interactive" }, snapshot),
         explanation: "List the page's interactive controls and form fields.",
         confidence: 0.96
       };
     }
     if (/^(suggest|suggest next actions|next actions)$/.test(comparable)) {
       return {
-        request: { kind: "scan-page", mode: "suggestions" },
+        request: withSnapshotTabContext({ kind: "scan-page", mode: "suggestions" }, snapshot),
         explanation: "Generate suggested next actions from the current page.",
         confidence: 0.94
       };
@@ -471,7 +562,7 @@
       const element = findInteractiveElement(snapshot, "like", { tags: ["button", "a", "summary", "input"] });
       if (element) {
         return {
-          request: {
+          request: withSnapshotTabContext({
             kind: "request-action",
             action: {
               actionId: globalThis.crypto?.randomUUID?.() ?? `action_${Date.now()}_${Math.random().toString(16).slice(2)}`,
@@ -481,7 +572,7 @@
               label: element.label || element.text || "Like",
               selector: element.selector
             }
-          },
+          }, snapshot),
           explanation: "Click the first visible Like control in the LinkedIn feed.",
           confidence: 0.88
         };
@@ -494,7 +585,7 @@
         const element = findEditableElement(snapshot);
         if (element) {
           return {
-            request: {
+            request: withSnapshotTabContext({
               kind: "request-action",
               action: {
                 actionId: globalThis.crypto?.randomUUID?.() ?? `action_${Date.now()}_${Math.random().toString(16).slice(2)}`,
@@ -504,7 +595,7 @@
                 text,
                 clearBeforeTyping: false
               }
-            },
+            }, snapshot),
             explanation: "Type into the Google Docs editor surface.",
             confidence: 0.86
           };
@@ -515,7 +606,7 @@
       const element = findInteractiveElement(snapshot, "new", { tags: ["button", "a", "summary"] }) ?? findInteractiveElement(snapshot, "blank", { tags: ["button", "a", "summary"] });
       if (element) {
         return {
-          request: {
+          request: withSnapshotTabContext({
             kind: "request-action",
             action: {
               actionId: globalThis.crypto?.randomUUID?.() ?? `action_${Date.now()}_${Math.random().toString(16).slice(2)}`,
@@ -525,7 +616,7 @@
               label: element.label || element.text || "New",
               selector: element.selector
             }
-          },
+          }, snapshot),
           explanation: "Open the Google Drive New menu to create a new document.",
           confidence: 0.82
         };
@@ -557,7 +648,7 @@
         return null;
       }
       return {
-        request: {
+        request: withSnapshotTabContext({
           kind: "request-action",
           action: {
             actionId: globalThis.crypto?.randomUUID?.() ?? `action_${Date.now()}_${Math.random().toString(16).slice(2)}`,
@@ -566,7 +657,7 @@
             elementId: element.elementId,
             label: element.label || element.text || target
           }
-        },
+        }, snapshot),
         explanation: `Click the control that best matches "${target}".`,
         confidence: 0.82
       };
@@ -586,7 +677,7 @@
         return null;
       }
       return {
-        request: {
+        request: withSnapshotTabContext({
           kind: "request-action",
           action: {
             actionId: globalThis.crypto?.randomUUID?.() ?? `action_${Date.now()}_${Math.random().toString(16).slice(2)}`,
@@ -596,7 +687,7 @@
             text,
             clearBeforeTyping: true
           }
-        },
+        }, snapshot),
         explanation: `Type text into the field that best matches "${target}".`,
         confidence: 0.84
       };
@@ -616,7 +707,7 @@
         return null;
       }
       return {
-        request: {
+        request: withSnapshotTabContext({
           kind: "request-action",
           action: {
             actionId: globalThis.crypto?.randomUUID?.() ?? `action_${Date.now()}_${Math.random().toString(16).slice(2)}`,
@@ -625,7 +716,7 @@
             elementId: element.elementId,
             selection: { by: "label", value: optionText }
           }
-        },
+        }, snapshot),
         explanation: `Select "${optionText}" in the dropdown that best matches "${target}".`,
         confidence: 0.84
       };
@@ -640,7 +731,7 @@
         return null;
       }
       return {
-        request: {
+        request: withSnapshotTabContext({
           kind: "request-action",
           action: {
             actionId: globalThis.crypto?.randomUUID?.() ?? `action_${Date.now()}_${Math.random().toString(16).slice(2)}`,
@@ -649,7 +740,7 @@
             elementId: element.elementId,
             label: element.label || element.text || target
           }
-        },
+        }, snapshot),
         explanation: `Submit the form control that best matches "${target || element.label || element.text}".`,
         confidence: 0.78
       };
@@ -792,13 +883,17 @@
       if (!existingNextStep) {
         return null;
       }
+      const snapshotContext = snapshot ? buildTabContextFromSnapshot(snapshot) : null;
       const resumedStep = {
         ...existingNextStep,
         stepId: existingNextStep.stepId,
         title: `Resume workflow: ${existingNextStep.title}`,
         description: `Continue the active workflow at step ${activeWorkflow.currentStepIndex + 1}.`,
         source: "memory",
-        request: existingNextStep.request ? cloneRequestWithWorkflowContext(existingNextStep.request, activeWorkflow.workflowId, existingNextStep.stepId) : null,
+        request: existingNextStep.request && snapshotContext ? attachTabContextToRequest(
+          cloneRequestWithWorkflowContext(existingNextStep.request, activeWorkflow.workflowId, existingNextStep.stepId),
+          snapshotContext
+        ) : existingNextStep.request ? cloneRequestWithWorkflowContext(existingNextStep.request, activeWorkflow.workflowId, existingNextStep.stepId) : null,
         status: existingNextStep.status === "completed" ? "pending" : existingNextStep.status,
         updatedAt: nowIso(),
         notes: existingNextStep.notes
@@ -1092,6 +1187,7 @@
         </div>
       </div>
       <div class="suggestion__description">${escapeHtml(suggestion.description)}</div>
+      <div class="suggestion__context">${escapeHtml(`On ${formatTabContext(suggestion.tabContext)}`)}</div>
       ${suggestion.selector ? `<div class="suggestion__selector">${escapeHtml(suggestion.selector)}</div>` : ""}
       <div class="suggestion__cta">${escapeHtml(suggestion.buttonLabel)}</div>
     </button>`;
@@ -1924,11 +2020,40 @@
         }, 3e3);
       }
     }
+    attachTabContext(request) {
+      const activeTab = this.activeTab();
+      const activeContext = activeTab ? buildTabContextFromTrackedTab(activeTab) : null;
+      if (!activeContext) {
+        return request;
+      }
+      switch (request.kind) {
+        case "scan-page":
+        case "list-interactive-elements":
+        case "summarize-page":
+        case "suggest-next-actions":
+          return request.tabContext ? request : { ...request, tabContext: activeContext };
+        case "request-action": {
+          const context = request.tabContext ?? request.action.tabContext ?? activeContext;
+          const actionTabId = request.action.tabId >= 0 ? request.action.tabId : context.tabId;
+          return {
+            ...request,
+            tabContext: context,
+            action: {
+              ...request.action,
+              tabId: actionTabId,
+              tabContext: context
+            }
+          };
+        }
+        default:
+          return request;
+      }
+    }
     send(request) {
-      this.port?.postMessage(request);
+      this.port?.postMessage(this.attachTabContext(request));
     }
     sendSuggestion(request) {
-      this.port?.postMessage(request);
+      this.port?.postMessage(this.attachTabContext(request));
     }
     async handleCommandSubmit() {
       const value = this.commandInput.value.trim();
@@ -1961,13 +2086,7 @@
         this.port?.postMessage({ kind: "plan-workflow", workflow: preview.workflow });
       }
       if (preview.primaryRequest) {
-        const request = preview.primaryRequest;
-        if (request.kind === "request-action") {
-          const activeTab2 = this.activeTab();
-          if (activeTab2) {
-            request.action.tabId = activeTab2.tabId;
-          }
-        }
+        const request = this.attachTabContext(preview.primaryRequest);
         window.setTimeout(() => {
           this.port?.postMessage(request);
         }, 0);

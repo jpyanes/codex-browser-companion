@@ -62,10 +62,12 @@ describe("semantic bridge helpers", () => {
     expect(suggestions).toHaveLength(1);
     expect(suggestions[0]?.source).toBe("stagehand");
     expect(suggestions[0]?.selector).toBe("button.primary");
+    expect(suggestions[0]?.tabContext.tabId).toBe(snapshot.tabId);
     expect(suggestions[0]?.request.kind).toBe("request-action");
     if (suggestions[0]?.request.kind === "request-action" && "elementId" in suggestions[0].request.action) {
       expect(suggestions[0].request.action.elementId).toBe("element-1");
       expect(suggestions[0].request.action.selector).toBe("button.primary");
+      expect(suggestions[0].request.action.tabContext?.tabId).toBe(snapshot.tabId);
     }
   });
 

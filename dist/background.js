@@ -311,8 +311,101 @@ async function refreshBridgeState(endpoint = DEFAULT_BRIDGE_ENDPOINT) {
   }
 }
 
-// src/shared/semantic.ts
+// src/shared/tab-context.ts
 function isRecord2(value) {
+  return typeof value === "object" && value !== null;
+}
+function isPageKind(value) {
+  return value === "unknown" || value === "document" || value === "mixed" || value === "article" || value === "form" || value === "login" || value === "payment" || value === "spa";
+}
+function normalizeString(value) {
+  return typeof value === "string" ? value : "";
+}
+function normalizeNumber(value, fallback) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+function isValidTabId(tabId) {
+  return typeof tabId === "number" && Number.isFinite(tabId) && tabId >= 0;
+}
+function buildTabContextFromSnapshot(snapshot) {
+  return {
+    tabId: snapshot.tabId,
+    windowId: null,
+    url: snapshot.url,
+    title: snapshot.title,
+    pageKind: snapshot.pageKind,
+    siteAdapterId: snapshot.siteAdapter?.id ?? null,
+    siteAdapterLabel: snapshot.siteAdapter?.label ?? null,
+    snapshotId: snapshot.snapshotId,
+    capturedAt: snapshot.capturedAt
+  };
+}
+function normalizeTabContext(value) {
+  if (!isRecord2(value)) {
+    return null;
+  }
+  const tabId = normalizeNumber(value.tabId, -1);
+  if (!isValidTabId(tabId)) {
+    return null;
+  }
+  return {
+    tabId,
+    windowId: typeof value.windowId === "number" && Number.isFinite(value.windowId) ? value.windowId : null,
+    url: normalizeString(value.url),
+    title: normalizeString(value.title),
+    pageKind: isPageKind(value.pageKind) ? value.pageKind : "unknown",
+    siteAdapterId: typeof value.siteAdapterId === "string" ? value.siteAdapterId : null,
+    siteAdapterLabel: typeof value.siteAdapterLabel === "string" ? value.siteAdapterLabel : null,
+    snapshotId: typeof value.snapshotId === "string" ? value.snapshotId : null,
+    capturedAt: typeof value.capturedAt === "string" ? value.capturedAt : null
+  };
+}
+function attachTabContextToAction(action, tabContext) {
+  return {
+    ...action,
+    tabContext
+  };
+}
+function attachTabContextToRequest(request, tabContext) {
+  if (request.kind === "request-action") {
+    return {
+      ...request,
+      tabContext,
+      action: attachTabContextToAction(request.action, tabContext)
+    };
+  }
+  return {
+    ...request,
+    tabContext
+  };
+}
+function resolveSuggestedRequestTabId(request) {
+  if (!request) {
+    return null;
+  }
+  if (request.kind === "request-action") {
+    const contextTabId2 = request.action.tabContext?.tabId;
+    if (isValidTabId(contextTabId2)) {
+      return contextTabId2;
+    }
+    return isValidTabId(request.action.tabId) ? request.action.tabId : null;
+  }
+  const contextTabId = request.tabContext?.tabId;
+  return isValidTabId(contextTabId) ? contextTabId : null;
+}
+function resolveActionTabId(action) {
+  if (!action) {
+    return null;
+  }
+  const contextTabId = action.tabContext?.tabId;
+  if (isValidTabId(contextTabId)) {
+    return contextTabId;
+  }
+  return isValidTabId(action.tabId) ? action.tabId : null;
+}
+
+// src/shared/semantic.ts
+function isRecord3(value) {
   return typeof value === "object" && value !== null;
 }
 function toStringOrNull2(value) {
@@ -396,20 +489,22 @@ async function buildSemanticSuggestions(observation, snapshot, resolveTarget) {
     if (!resolved) {
       continue;
     }
-    const actionRequest = {
+    const tabContext = buildTabContextFromSnapshot(snapshot);
+    const actionRequest = attachTabContextToAction({
       actionId: globalThis.crypto?.randomUUID?.() ?? `action_${Date.now()}_${Math.random().toString(16).slice(2)}`,
       tabId: snapshot.tabId,
       kind: "click",
       elementId: resolved.elementId,
       label: resolved.label || action.description || selector,
       selector
-    };
+    }, tabContext);
     suggestions.push({
       id: `stagehand-${snapshot.snapshotId}-${index}`,
       title: action.description || resolved.label || "Semantic click target",
       description: `Stagehand suggested ${action.description || "a click action"}.`,
       buttonLabel: "Queue",
-      request: { kind: "request-action", action: actionRequest },
+      tabContext,
+      request: attachTabContextToRequest({ kind: "request-action", action: actionRequest }, tabContext),
       approvalRequired: true,
       dangerLevel: classifyDanger(actionRequest, snapshot),
       source: "stagehand",
@@ -420,7 +515,7 @@ async function buildSemanticSuggestions(observation, snapshot, resolveTarget) {
   return suggestions;
 }
 function normalizeSemanticHealth(value, fallbackEndpoint = DEFAULT_SEMANTIC_ENDPOINT) {
-  if (!isRecord2(value)) {
+  if (!isRecord3(value)) {
     return {
       endpoint: fallbackEndpoint,
       browserEndpoint: "",
@@ -434,7 +529,7 @@ function normalizeSemanticHealth(value, fallbackEndpoint = DEFAULT_SEMANTIC_ENDP
   const status = toStringOrNull2(value.status);
   const browserEndpoint = toStringOrNull2(value.browserEndpoint) ?? "";
   const observedAt = toStringOrNull2(value.observedAt);
-  const lastError = isRecord2(value.lastError) ? normalizeError(value.lastError, "SEMANTIC_BRIDGE_ERROR", { recoverable: true }) : null;
+  const lastError = isRecord3(value.lastError) ? normalizeError(value.lastError, "SEMANTIC_BRIDGE_ERROR", { recoverable: true }) : null;
   return {
     endpoint: toStringOrNull2(value.endpoint) ?? fallbackEndpoint,
     browserEndpoint,
@@ -446,7 +541,7 @@ function normalizeSemanticHealth(value, fallbackEndpoint = DEFAULT_SEMANTIC_ENDP
   };
 }
 function normalizeSemanticObservation(value, fallbackEndpoint = DEFAULT_SEMANTIC_ENDPOINT) {
-  if (!isRecord2(value)) {
+  if (!isRecord3(value)) {
     return {
       endpoint: fallbackEndpoint,
       browserEndpoint: "",
@@ -459,7 +554,7 @@ function normalizeSemanticObservation(value, fallbackEndpoint = DEFAULT_SEMANTIC
       actions: []
     };
   }
-  const actions = Array.isArray(value.actions) ? value.actions.filter(isRecord2).map((entry) => ({
+  const actions = Array.isArray(value.actions) ? value.actions.filter(isRecord3).map((entry) => ({
     selector: toStringOrNull2(entry.selector) ?? "",
     description: toStringOrNull2(entry.description) ?? "",
     method: toStringOrNull2(entry.method) ?? void 0,
@@ -483,7 +578,7 @@ function normalizeSemanticObservation(value, fallbackEndpoint = DEFAULT_SEMANTIC
 function makeId(prefix) {
   return globalThis.crypto?.randomUUID?.() ?? `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
-function isRecord3(value) {
+function isRecord4(value) {
   return typeof value === "object" && value !== null;
 }
 function normalize(input) {
@@ -514,49 +609,60 @@ function normalizeDangerLevel(value) {
   return "low";
 }
 function normalizeRequest(value) {
-  if (!isRecord3(value) || typeof value.kind !== "string") {
+  if (!isRecord4(value) || typeof value.kind !== "string") {
     return null;
   }
+  const tabContext = normalizeTabContext(value.tabContext);
   switch (value.kind) {
     case "scan-page":
       return {
         kind: "scan-page",
         mode: value.mode === "interactive" || value.mode === "summary" || value.mode === "suggestions" ? value.mode : "full",
+        ...tabContext ? { tabContext } : {},
         ...typeof value.workflowId === "string" ? { workflowId: value.workflowId } : {},
         ...typeof value.workflowStepId === "string" ? { workflowStepId: value.workflowStepId } : {}
       };
     case "list-interactive-elements":
       return {
         kind: "list-interactive-elements",
+        ...tabContext ? { tabContext } : {},
         ...typeof value.workflowId === "string" ? { workflowId: value.workflowId } : {},
         ...typeof value.workflowStepId === "string" ? { workflowStepId: value.workflowStepId } : {}
       };
     case "summarize-page":
       return {
         kind: "summarize-page",
+        ...tabContext ? { tabContext } : {},
         ...typeof value.workflowId === "string" ? { workflowId: value.workflowId } : {},
         ...typeof value.workflowStepId === "string" ? { workflowStepId: value.workflowStepId } : {}
       };
     case "suggest-next-actions":
       return {
         kind: "suggest-next-actions",
+        ...tabContext ? { tabContext } : {},
         ...typeof value.workflowId === "string" ? { workflowId: value.workflowId } : {},
         ...typeof value.workflowStepId === "string" ? { workflowStepId: value.workflowStepId } : {}
       };
     case "request-action":
-      if (!isRecord3(value.action) || typeof value.action.kind !== "string" || typeof value.action.actionId !== "string" || typeof value.action.tabId !== "number") {
+      if (!isRecord4(value.action) || typeof value.action.kind !== "string" || typeof value.action.actionId !== "string" || typeof value.action.tabId !== "number") {
         return null;
       }
+      const actionTabContext = normalizeTabContext(value.action.tabContext) ?? tabContext;
+      const action = value.action;
       return {
         kind: "request-action",
-        action: value.action
+        ...actionTabContext ? { tabContext: actionTabContext } : {},
+        action: {
+          ...action,
+          ...actionTabContext ? { tabContext: actionTabContext } : {}
+        }
       };
     default:
       return null;
   }
 }
 function normalizeStep(value) {
-  if (!isRecord3(value)) {
+  if (!isRecord4(value)) {
     return null;
   }
   const request = normalizeRequest(value.request);
@@ -578,7 +684,7 @@ function normalizeStep(value) {
   };
 }
 function normalizeHistoryEntry(value) {
-  if (!isRecord3(value)) {
+  if (!isRecord4(value)) {
     return null;
   }
   return {
@@ -596,7 +702,7 @@ function normalizeHistoryEntry(value) {
   };
 }
 function normalizeWorkflowPlan(value) {
-  if (!isRecord3(value)) {
+  if (!isRecord4(value)) {
     return null;
   }
   const steps = Array.isArray(value.steps) ? value.steps.map(normalizeStep).filter((step) => Boolean(step)).slice(0, MAX_WORKFLOW_STEPS) : [];
@@ -822,16 +928,18 @@ function requestLabelForStep(step, stepNumber, workflow) {
   }
   return `Step ${stepNumber}: ${step.title}`;
 }
-function buildWorkflowStepSuggestion(workflow, step, index) {
+function buildWorkflowStepSuggestion(workflow, step, index, snapshot) {
   if (!step.request || step.status === "blocked") {
     return null;
   }
+  const tabContext = step.request.tabContext ?? (step.request.kind === "request-action" ? step.request.action.tabContext : null) ?? buildTabContextFromSnapshot(snapshot);
   return {
     id: `workflow-${workflow.workflowId}-${step.stepId}`,
     title: requestLabelForStep(step, index + 1, workflow),
     description: step.description || `Continue the workflow "${workflow.objective}".`,
     buttonLabel: step.request.kind === "request-action" ? "Queue step" : "Run step",
     request: step.request,
+    tabContext,
     approvalRequired: step.approvalRequired,
     dangerLevel: step.dangerLevel,
     source: "workflow",
@@ -844,16 +952,18 @@ function buildWorkflowRescanSuggestion(workflow, snapshot) {
   if (!changedPage) {
     return null;
   }
+  const tabContext = buildTabContextFromSnapshot(snapshot);
   return {
     id: `workflow-rescan-${workflow.workflowId}-${snapshot.snapshotId}`,
     title: `Rescan before continuing "${workflow.objective}"`,
     description: `The workflow was last observed on ${workflow.lastPageTitle || workflow.lastPageUrl || "a previous page"} and the active tab has changed.`,
     buttonLabel: "Rescan",
-    request: {
+    tabContext,
+    request: attachTabContextToRequest({
       kind: "scan-page",
       mode: "suggestions",
       workflowId: workflow.workflowId
-    },
+    }, tabContext),
     approvalRequired: false,
     dangerLevel: "low",
     source: "workflow",
@@ -873,7 +983,7 @@ function buildWorkflowSuggestions(workflowState, snapshot) {
   }
   const nextStep = getWorkflowNextStep(workflow);
   if (nextStep) {
-    const stepSuggestion = buildWorkflowStepSuggestion(workflow, nextStep, workflow.currentStepIndex);
+    const stepSuggestion = buildWorkflowStepSuggestion(workflow, nextStep, workflow.currentStepIndex, snapshot);
     if (stepSuggestion) {
       suggestions.push(stepSuggestion);
     }
@@ -1086,14 +1196,14 @@ function resolvePageStateFromSnapshot(snapshot) {
 }
 
 // src/shared/messages.ts
-function isRecord4(value) {
+function isRecord5(value) {
   return typeof value === "object" && value !== null;
 }
 function isUiRequest(value) {
-  return isRecord4(value) && typeof value.kind === "string";
+  return isRecord5(value) && typeof value.kind === "string";
 }
 function isContentEvent(value) {
-  return isRecord4(value) && typeof value.kind === "string";
+  return isRecord5(value) && typeof value.kind === "string";
 }
 
 // src/shared/storage.ts
@@ -1709,8 +1819,21 @@ async function scanTrackedTab(tabId, mode, workflowContext = null) {
 function pruneApprovals(approvals) {
   return truncateEntries(approvals, MAX_APPROVAL_QUEUE_ENTRIES);
 }
+function findApprovalById(approvalId) {
+  for (const [tabKey, tabState] of Object.entries(state.tabs)) {
+    const tabId = Number.parseInt(tabKey, 10);
+    if (!Number.isFinite(tabId)) {
+      continue;
+    }
+    const approval = tabState.approvals.find((entry) => entry.approvalId === approvalId);
+    if (approval) {
+      return { tabId, approval };
+    }
+  }
+  return null;
+}
 async function queueActionForApproval(action) {
-  const tabId = state.activeTabId;
+  const tabId = resolveActionTabId(action) ?? state.activeTabId;
   if (tabId === null) {
     const error = normalizeError("No active tab is available.", "NO_ACTIVE_TAB", { recoverable: true });
     commit({ kind: "error", error });
@@ -1816,14 +1939,16 @@ async function executeApprovedAction(tabId, action, approvalId) {
   }
 }
 async function approveAction(approvalId) {
-  const tabId = state.activeTabId;
-  if (tabId === null) {
+  const approvalLocation = findApprovalById(approvalId);
+  if (!approvalLocation) {
     return;
   }
-  const tabState = getTabState(tabId);
-  const approval = tabState.approvals.find((entry) => entry.approvalId === approvalId);
-  if (!approval || approval.status !== "pending") {
+  const { tabId, approval } = approvalLocation;
+  if (approval.status !== "pending") {
     return;
+  }
+  if (state.activeTabId !== tabId) {
+    await focusTrackedTab(tabId);
   }
   replaceTabState(tabId, (current) => ({
     ...current,
@@ -1845,15 +1970,11 @@ async function approveAction(approvalId) {
   await executeApprovedAction(tabId, approval.action, approval.approvalId);
 }
 async function rejectAction(approvalId) {
-  const tabId = state.activeTabId;
-  if (tabId === null) {
+  const approvalLocation = findApprovalById(approvalId);
+  if (!approvalLocation) {
     return;
   }
-  const tabState = getTabState(tabId);
-  const approval = tabState.approvals.find((entry) => entry.approvalId === approvalId);
-  if (!approval) {
-    return;
-  }
+  const { tabId, approval } = approvalLocation;
   const updated = {
     ...approval,
     status: "rejected",
@@ -1917,6 +2038,10 @@ function clearActiveTabLog() {
   commit();
 }
 async function handleUiRequest(port, request) {
+  const workflowContext = "workflowId" in request || "workflowStepId" in request ? {
+    ...typeof request.workflowId === "string" ? { workflowId: request.workflowId } : {},
+    ...typeof request.workflowStepId === "string" ? { workflowStepId: request.workflowStepId } : {}
+  } : null;
   switch (request.kind) {
     case "get-state":
       await refreshKnownTabs();
@@ -1925,40 +2050,32 @@ async function handleUiRequest(port, request) {
       void refreshSemanticStatus();
       return;
     case "scan-page":
-      await scanActiveTab(
-        request.mode,
-        request.workflowId || request.workflowStepId ? {
-          ...request.workflowId ? { workflowId: request.workflowId } : {},
-          ...request.workflowStepId ? { workflowStepId: request.workflowStepId } : {}
-        } : null
-      );
+      if (resolveSuggestedRequestTabId(request) !== null) {
+        await scanTrackedTab(resolveSuggestedRequestTabId(request), request.mode, workflowContext);
+      } else {
+        await scanActiveTab(request.mode, workflowContext);
+      }
       return;
     case "list-interactive-elements":
-      await scanActiveTab(
-        "interactive",
-        request.workflowId || request.workflowStepId ? {
-          ...request.workflowId ? { workflowId: request.workflowId } : {},
-          ...request.workflowStepId ? { workflowStepId: request.workflowStepId } : {}
-        } : null
-      );
+      if (resolveSuggestedRequestTabId(request) !== null) {
+        await scanTrackedTab(resolveSuggestedRequestTabId(request), "interactive", workflowContext);
+      } else {
+        await scanActiveTab("interactive", workflowContext);
+      }
       return;
     case "summarize-page":
-      await scanActiveTab(
-        "summary",
-        request.workflowId || request.workflowStepId ? {
-          ...request.workflowId ? { workflowId: request.workflowId } : {},
-          ...request.workflowStepId ? { workflowStepId: request.workflowStepId } : {}
-        } : null
-      );
+      if (resolveSuggestedRequestTabId(request) !== null) {
+        await scanTrackedTab(resolveSuggestedRequestTabId(request), "summary", workflowContext);
+      } else {
+        await scanActiveTab("summary", workflowContext);
+      }
       return;
     case "suggest-next-actions":
-      await scanActiveTab(
-        "suggestions",
-        request.workflowId || request.workflowStepId ? {
-          ...request.workflowId ? { workflowId: request.workflowId } : {},
-          ...request.workflowStepId ? { workflowStepId: request.workflowStepId } : {}
-        } : null
-      );
+      if (resolveSuggestedRequestTabId(request) !== null) {
+        await scanTrackedTab(resolveSuggestedRequestTabId(request), "suggestions", workflowContext);
+      } else {
+        await scanActiveTab("suggestions", workflowContext);
+      }
       return;
     case "request-action":
       await queueActionForApproval(request.action);

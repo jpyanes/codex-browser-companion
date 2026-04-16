@@ -32,6 +32,31 @@ describe("page extraction", () => {
     expect(snapshot.summary).toContain("interactive control");
   });
 
+  it("attaches tab context to next-action suggestions", () => {
+    const document = makeDocument(`
+      <!doctype html>
+      <html>
+        <head><title>Primary Action</title></head>
+        <body>
+          <main>
+            <button>Continue</button>
+            <a href="/details">Read more</a>
+          </main>
+        </body>
+      </html>
+    `);
+
+    const snapshot = capturePageSnapshot(document, { mode: "suggestions", navigationMode: "document" }).snapshot;
+    const primarySuggestion = snapshot.suggestedActions.find((action) => action.request.kind === "request-action");
+
+    expect(primarySuggestion).toBeDefined();
+    expect(snapshot.suggestedActions.every((action) => action.tabContext.tabId === snapshot.tabId)).toBe(true);
+    expect(primarySuggestion?.tabContext.tabId).toBe(snapshot.tabId);
+    if (primarySuggestion?.request.kind === "request-action") {
+      expect(primarySuggestion.request.action.tabContext?.tabId).toBe(snapshot.tabId);
+    }
+  });
+
   it("captures a form page without leaking values", () => {
     const document = makeDocument(`
       <!doctype html>

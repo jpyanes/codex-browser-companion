@@ -1,4 +1,5 @@
 import { DEFAULT_SCROLL_AMOUNT } from "./constants";
+import { attachTabContextToRequest, buildTabContextFromSnapshot } from "./tab-context";
 import type { ActionRequest, InteractiveElementSummary, PageSnapshot, SuggestedRequest, SuggestedRequestAction } from "./types";
 
 export interface ParsedInstruction {
@@ -149,6 +150,14 @@ function parseBackForwardRefresh(input: string): SuggestedRequestAction | null {
   return null;
 }
 
+function withSnapshotTabContext<T extends SuggestedRequest>(request: T, snapshot: PageSnapshot | null): T {
+  if (!snapshot) {
+    return request;
+  }
+
+  return attachTabContextToRequest(request, buildTabContextFromSnapshot(snapshot));
+}
+
 export function parseInstruction(input: string, snapshot: PageSnapshot | null): ParsedInstruction | null {
   const trimmed = normalize(input);
   if (!trimmed) {
@@ -164,7 +173,7 @@ export function parseInstruction(input: string, snapshot: PageSnapshot | null): 
       | "interactive"
       | "suggestions";
     return {
-      request: { kind: "scan-page", mode },
+      request: withSnapshotTabContext({ kind: "scan-page", mode }, snapshot),
       explanation: `Queue a ${mode} scan of the current page.`,
       confidence: 0.96,
     };
@@ -172,7 +181,7 @@ export function parseInstruction(input: string, snapshot: PageSnapshot | null): 
 
   if (/^(summarize|summary)( page)?$/.test(comparable)) {
     return {
-      request: { kind: "scan-page", mode: "summary" },
+      request: withSnapshotTabContext({ kind: "scan-page", mode: "summary" }, snapshot),
       explanation: "Summarize the current page.",
       confidence: 0.98,
     };
@@ -180,7 +189,7 @@ export function parseInstruction(input: string, snapshot: PageSnapshot | null): 
 
   if (/^(list|show|inspect) (interactive|controls|elements)( on page)?$/.test(comparable) || comparable === "interactive elements") {
     return {
-      request: { kind: "scan-page", mode: "interactive" },
+      request: withSnapshotTabContext({ kind: "scan-page", mode: "interactive" }, snapshot),
       explanation: "List the page's interactive controls and form fields.",
       confidence: 0.96,
     };
@@ -188,7 +197,7 @@ export function parseInstruction(input: string, snapshot: PageSnapshot | null): 
 
   if (/^(suggest|suggest next actions|next actions)$/.test(comparable)) {
     return {
-      request: { kind: "scan-page", mode: "suggestions" },
+      request: withSnapshotTabContext({ kind: "scan-page", mode: "suggestions" }, snapshot),
       explanation: "Generate suggested next actions from the current page.",
       confidence: 0.94,
     };
@@ -198,7 +207,7 @@ export function parseInstruction(input: string, snapshot: PageSnapshot | null): 
     const element = findInteractiveElement(snapshot, "like", { tags: ["button", "a", "summary", "input"] });
     if (element) {
       return {
-        request: {
+        request: withSnapshotTabContext({
           kind: "request-action",
           action: {
             actionId: globalThis.crypto?.randomUUID?.() ?? `action_${Date.now()}_${Math.random().toString(16).slice(2)}`,
@@ -208,7 +217,7 @@ export function parseInstruction(input: string, snapshot: PageSnapshot | null): 
             label: element.label || element.text || "Like",
             selector: element.selector,
           },
-        },
+        }, snapshot),
         explanation: 'Click the first visible Like control in the LinkedIn feed.',
         confidence: 0.88,
       };
@@ -226,7 +235,7 @@ export function parseInstruction(input: string, snapshot: PageSnapshot | null): 
       const element = findEditableElement(snapshot);
       if (element) {
         return {
-          request: {
+          request: withSnapshotTabContext({
             kind: "request-action",
             action: {
               actionId: globalThis.crypto?.randomUUID?.() ?? `action_${Date.now()}_${Math.random().toString(16).slice(2)}`,
@@ -236,7 +245,7 @@ export function parseInstruction(input: string, snapshot: PageSnapshot | null): 
               text,
               clearBeforeTyping: false,
             },
-          },
+          }, snapshot),
           explanation: "Type into the Google Docs editor surface.",
           confidence: 0.86,
         };
@@ -251,7 +260,7 @@ export function parseInstruction(input: string, snapshot: PageSnapshot | null): 
     const element = findInteractiveElement(snapshot, "new", { tags: ["button", "a", "summary"] }) ?? findInteractiveElement(snapshot, "blank", { tags: ["button", "a", "summary"] });
     if (element) {
       return {
-        request: {
+        request: withSnapshotTabContext({
           kind: "request-action",
           action: {
             actionId: globalThis.crypto?.randomUUID?.() ?? `action_${Date.now()}_${Math.random().toString(16).slice(2)}`,
@@ -261,7 +270,7 @@ export function parseInstruction(input: string, snapshot: PageSnapshot | null): 
             label: element.label || element.text || "New",
             selector: element.selector,
           },
-        },
+        }, snapshot),
         explanation: "Open the Google Drive New menu to create a new document.",
         confidence: 0.82,
       };
@@ -298,7 +307,7 @@ export function parseInstruction(input: string, snapshot: PageSnapshot | null): 
     }
 
     return {
-      request: {
+      request: withSnapshotTabContext({
         kind: "request-action",
         action: {
           actionId: globalThis.crypto?.randomUUID?.() ?? `action_${Date.now()}_${Math.random().toString(16).slice(2)}`,
@@ -307,7 +316,7 @@ export function parseInstruction(input: string, snapshot: PageSnapshot | null): 
           elementId: element.elementId,
           label: element.label || element.text || target,
         },
-      },
+      }, snapshot),
       explanation: `Click the control that best matches "${target}".`,
       confidence: 0.82,
     };
@@ -331,7 +340,7 @@ export function parseInstruction(input: string, snapshot: PageSnapshot | null): 
     }
 
     return {
-      request: {
+      request: withSnapshotTabContext({
         kind: "request-action",
         action: {
           actionId: globalThis.crypto?.randomUUID?.() ?? `action_${Date.now()}_${Math.random().toString(16).slice(2)}`,
@@ -341,7 +350,7 @@ export function parseInstruction(input: string, snapshot: PageSnapshot | null): 
           text,
           clearBeforeTyping: true,
         },
-      },
+      }, snapshot),
       explanation: `Type text into the field that best matches "${target}".`,
       confidence: 0.84,
     };
@@ -365,7 +374,7 @@ export function parseInstruction(input: string, snapshot: PageSnapshot | null): 
     }
 
     return {
-      request: {
+      request: withSnapshotTabContext({
         kind: "request-action",
         action: {
           actionId: globalThis.crypto?.randomUUID?.() ?? `action_${Date.now()}_${Math.random().toString(16).slice(2)}`,
@@ -374,7 +383,7 @@ export function parseInstruction(input: string, snapshot: PageSnapshot | null): 
           elementId: element.elementId,
           selection: { by: "label", value: optionText },
         },
-      },
+      }, snapshot),
       explanation: `Select "${optionText}" in the dropdown that best matches "${target}".`,
       confidence: 0.84,
     };
@@ -392,7 +401,7 @@ export function parseInstruction(input: string, snapshot: PageSnapshot | null): 
     }
 
     return {
-      request: {
+      request: withSnapshotTabContext({
         kind: "request-action",
         action: {
           actionId: globalThis.crypto?.randomUUID?.() ?? `action_${Date.now()}_${Math.random().toString(16).slice(2)}`,
@@ -401,7 +410,7 @@ export function parseInstruction(input: string, snapshot: PageSnapshot | null): 
           elementId: element.elementId,
           label: element.label || element.text || target,
         },
-      },
+      }, snapshot),
       explanation: `Submit the form control that best matches "${target || element.label || element.text}".`,
       confidence: 0.78,
     };

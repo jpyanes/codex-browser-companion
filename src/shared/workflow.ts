@@ -6,6 +6,7 @@ import {
 import { classifyDanger, requiresApproval } from "./action-policy";
 import { parseInstruction } from "./instructions";
 import { nowIso } from "./logger";
+import { attachTabContextToRequest, buildTabContextFromSnapshot, normalizeTabContext } from "./tab-context";
 import type {
   ActionRequest,
   DangerLevel,
@@ -102,29 +103,35 @@ function normalizeRequest(value: unknown): SuggestedRequest | null {
     return null;
   }
 
+  const tabContext = normalizeTabContext(value.tabContext);
+
   switch (value.kind) {
     case "scan-page":
       return {
         kind: "scan-page",
         mode: value.mode === "interactive" || value.mode === "summary" || value.mode === "suggestions" ? value.mode : "full",
+        ...(tabContext ? { tabContext } : {}),
         ...(typeof value.workflowId === "string" ? { workflowId: value.workflowId } : {}),
         ...(typeof value.workflowStepId === "string" ? { workflowStepId: value.workflowStepId } : {}),
       };
     case "list-interactive-elements":
       return {
         kind: "list-interactive-elements",
+        ...(tabContext ? { tabContext } : {}),
         ...(typeof value.workflowId === "string" ? { workflowId: value.workflowId } : {}),
         ...(typeof value.workflowStepId === "string" ? { workflowStepId: value.workflowStepId } : {}),
       };
     case "summarize-page":
       return {
         kind: "summarize-page",
+        ...(tabContext ? { tabContext } : {}),
         ...(typeof value.workflowId === "string" ? { workflowId: value.workflowId } : {}),
         ...(typeof value.workflowStepId === "string" ? { workflowStepId: value.workflowStepId } : {}),
       };
     case "suggest-next-actions":
       return {
         kind: "suggest-next-actions",
+        ...(tabContext ? { tabContext } : {}),
         ...(typeof value.workflowId === "string" ? { workflowId: value.workflowId } : {}),
         ...(typeof value.workflowStepId === "string" ? { workflowStepId: value.workflowStepId } : {}),
       };
@@ -133,9 +140,15 @@ function normalizeRequest(value: unknown): SuggestedRequest | null {
         return null;
       }
 
+      const actionTabContext = normalizeTabContext(value.action.tabContext) ?? tabContext;
+      const action = value.action as unknown as ActionRequest;
       return {
         kind: "request-action",
-        action: value.action as unknown as ActionRequest,
+        ...(actionTabContext ? { tabContext: actionTabContext } : {}),
+        action: {
+          ...action,
+          ...(actionTabContext ? { tabContext: actionTabContext } : {}),
+        },
       };
     default:
       return null;
@@ -619,13 +632,23 @@ export function buildWorkflowPlanFromInstruction(
       return null;
     }
 
+    const snapshotContext = snapshot ? buildTabContextFromSnapshot(snapshot) : null;
+
     const resumedStep: WorkflowPlanStep = {
       ...existingNextStep,
       stepId: existingNextStep.stepId,
       title: `Resume workflow: ${existingNextStep.title}`,
       description: `Continue the active workflow at step ${activeWorkflow.currentStepIndex + 1}.`,
       source: "memory",
-      request: existingNextStep.request ? cloneRequestWithWorkflowContext(existingNextStep.request, activeWorkflow.workflowId, existingNextStep.stepId) : null,
+      request:
+        existingNextStep.request && snapshotContext
+          ? attachTabContextToRequest(
+              cloneRequestWithWorkflowContext(existingNextStep.request, activeWorkflow.workflowId, existingNextStep.stepId),
+              snapshotContext,
+            )
+          : existingNextStep.request
+            ? cloneRequestWithWorkflowContext(existingNextStep.request, activeWorkflow.workflowId, existingNextStep.stepId)
+            : null,
       status: existingNextStep.status === "completed" ? "pending" : existingNextStep.status,
       updatedAt: nowIso(),
       notes: existingNextStep.notes,
@@ -695,10 +718,15 @@ function requestLabelForStep(step: WorkflowPlanStep, stepNumber: number, workflo
   return `Step ${stepNumber}: ${step.title}`;
 }
 
-function buildWorkflowStepSuggestion(workflow: WorkflowPlan, step: WorkflowPlanStep, index: number): SuggestedAction | null {
+function buildWorkflowStepSuggestion(workflow: WorkflowPlan, step: WorkflowPlanStep, index: number, snapshot: PageSnapshot): SuggestedAction | null {
   if (!step.request || step.status === "blocked") {
     return null;
   }
+
+  const tabContext =
+    step.request.tabContext ??
+    (step.request.kind === "request-action" ? step.request.action.tabContext : null) ??
+    buildTabContextFromSnapshot(snapshot);
 
   return {
     id: `workflow-${workflow.workflowId}-${step.stepId}`,
@@ -706,6 +734,7 @@ function buildWorkflowStepSuggestion(workflow: WorkflowPlan, step: WorkflowPlanS
     description: step.description || `Continue the workflow "${workflow.objective}".`,
     buttonLabel: step.request.kind === "request-action" ? "Queue step" : "Run step",
     request: step.request,
+    tabContext,
     approvalRequired: step.approvalRequired,
     dangerLevel: step.dangerLevel,
     source: "workflow",
@@ -720,16 +749,19 @@ function buildWorkflowRescanSuggestion(workflow: WorkflowPlan, snapshot: PageSna
     return null;
   }
 
+  const tabContext = buildTabContextFromSnapshot(snapshot);
+
   return {
     id: `workflow-rescan-${workflow.workflowId}-${snapshot.snapshotId}`,
     title: `Rescan before continuing "${workflow.objective}"`,
     description: `The workflow was last observed on ${workflow.lastPageTitle || workflow.lastPageUrl || "a previous page"} and the active tab has changed.`,
     buttonLabel: "Rescan",
-    request: {
+    tabContext,
+    request: attachTabContextToRequest({
       kind: "scan-page",
       mode: "suggestions",
       workflowId: workflow.workflowId,
-    },
+    }, tabContext),
     approvalRequired: false,
     dangerLevel: "low",
     source: "workflow",
@@ -752,7 +784,7 @@ export function buildWorkflowSuggestions(workflowState: WorkflowState, snapshot:
 
   const nextStep = getWorkflowNextStep(workflow);
   if (nextStep) {
-    const stepSuggestion = buildWorkflowStepSuggestion(workflow, nextStep, workflow.currentStepIndex);
+    const stepSuggestion = buildWorkflowStepSuggestion(workflow, nextStep, workflow.currentStepIndex, snapshot);
     if (stepSuggestion) {
       suggestions.push(stepSuggestion);
     }

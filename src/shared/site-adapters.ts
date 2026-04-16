@@ -1,4 +1,5 @@
 import { classifyDanger } from "./action-policy";
+import { attachTabContextToAction, attachTabContextToRequest, buildTabContextFromSnapshot } from "./tab-context";
 import type {
   InteractiveElementSummary,
   PageKind,
@@ -43,34 +44,34 @@ function matchInteractiveElement(
 }
 
 function buildClickSuggestion(snapshot: PageSnapshot, element: InteractiveElementSummary, title: string, description: string): SuggestedAction {
+  const tabContext = buildTabContextFromSnapshot(snapshot);
+  const action = attachTabContextToAction(
+    {
+      actionId: makeSuggestionId("action"),
+      tabId: snapshot.tabId,
+      kind: "click",
+      elementId: element.elementId,
+      label: element.label || element.text || title,
+      selector: element.selector,
+    },
+    tabContext,
+  );
+
   return {
     id: makeSuggestionId(`site-${snapshot.snapshotId}`),
     title,
     description,
     buttonLabel: "Queue",
-    request: {
-      kind: "request-action",
-      action: {
-        actionId: makeSuggestionId("action"),
-        tabId: snapshot.tabId,
-        kind: "click",
-        elementId: element.elementId,
-        label: element.label || element.text || title,
-        selector: element.selector,
-      },
-    },
-    approvalRequired: true,
-    dangerLevel: classifyDanger(
+    tabContext,
+    request: attachTabContextToRequest(
       {
-        actionId: "preview",
-        tabId: snapshot.tabId,
-        kind: "click",
-        elementId: element.elementId,
-        label: element.label || element.text || title,
-        selector: element.selector,
+        kind: "request-action",
+        action,
       },
-      snapshot,
+      tabContext,
     ),
+    approvalRequired: true,
+    dangerLevel: classifyDanger(action, snapshot),
     source: "site",
     selector: element.selector,
     confidence: 0.9,

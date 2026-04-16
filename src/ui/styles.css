@@ -819,6 +819,12 @@ input {
   line-height: 1.55;
 }
 
+.suggestion__context {
+  color: var(--accent);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
 .suggestion__selector {
   padding: 8px 10px;
   border-radius: var(--radius-xs);

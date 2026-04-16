@@ -24,6 +24,18 @@ export interface WorkflowRequestContext {
   workflowStepId?: string;
 }
 
+export interface TabContext {
+  tabId: number;
+  windowId: number | null;
+  url: string;
+  title: string;
+  pageKind: PageKind;
+  siteAdapterId: string | null;
+  siteAdapterLabel: string | null;
+  snapshotId: string | null;
+  capturedAt: string | null;
+}
+
 export interface UserInterventionSummary {
   kind: UserInterventionKind;
   message: string;
@@ -176,6 +188,7 @@ export interface ActionRequestBase {
   tabId: number;
   kind: ActionKind;
   selector?: string;
+  tabContext?: TabContext;
   workflowId?: string;
   workflowStepId?: string;
 }
@@ -255,24 +268,28 @@ export interface ActionResult {
 export interface SuggestedRequestScanPage {
   kind: "scan-page";
   mode: ScanMode;
+  tabContext?: TabContext;
   workflowId?: string;
   workflowStepId?: string;
 }
 
 export interface SuggestedRequestListInteractive {
   kind: "list-interactive-elements";
+  tabContext?: TabContext;
   workflowId?: string;
   workflowStepId?: string;
 }
 
 export interface SuggestedRequestSummarize {
   kind: "summarize-page";
+  tabContext?: TabContext;
   workflowId?: string;
   workflowStepId?: string;
 }
 
 export interface SuggestedRequestSuggestNext {
   kind: "suggest-next-actions";
+  tabContext?: TabContext;
   workflowId?: string;
   workflowStepId?: string;
 }
@@ -280,6 +297,7 @@ export interface SuggestedRequestSuggestNext {
 export interface SuggestedRequestAction {
   kind: "request-action";
   action: ActionRequest;
+  tabContext?: TabContext;
 }
 
 export type SuggestedRequest =
@@ -294,6 +312,7 @@ export interface SuggestedAction {
   title: string;
   description: string;
   buttonLabel: string;
+  tabContext: TabContext;
   request: SuggestedRequest;
   approvalRequired: boolean;
   dangerLevel: DangerLevel;

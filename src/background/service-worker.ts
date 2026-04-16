@@ -33,6 +33,7 @@ import {
   recordWorkflowPlan,
 } from "../shared/workflow";
 import { summarizeTrackedTab } from "../shared/tab-orchestration";
+import { resolveActionTabId, resolveSuggestedRequestTabId } from "../shared/tab-context";
 import { requestSemanticObservation, refreshSemanticState } from "./semantic-client";
 import { resolvePageStateFromSnapshot, resolveUserIntervention } from "../shared/dom";
 import { createActivityLogEntry, normalizeError, nowIso } from "../shared/logger";
@@ -777,8 +778,24 @@ function pruneApprovals(approvals: ApprovalRequest[]): ApprovalRequest[] {
   return truncateEntries(approvals, MAX_APPROVAL_QUEUE_ENTRIES);
 }
 
+function findApprovalById(approvalId: string): { tabId: number; approval: ApprovalRequest } | null {
+  for (const [tabKey, tabState] of Object.entries(state.tabs)) {
+    const tabId = Number.parseInt(tabKey, 10);
+    if (!Number.isFinite(tabId)) {
+      continue;
+    }
+
+    const approval = tabState.approvals.find((entry) => entry.approvalId === approvalId);
+    if (approval) {
+      return { tabId, approval };
+    }
+  }
+
+  return null;
+}
+
 async function queueActionForApproval(action: ActionRequest): Promise<void> {
-  const tabId = state.activeTabId;
+  const tabId = resolveActionTabId(action) ?? state.activeTabId;
   if (tabId === null) {
     const error = normalizeError("No active tab is available.", "NO_ACTIVE_TAB", { recoverable: true });
     commit({ kind: "error", error });
@@ -902,15 +919,18 @@ async function executeApprovedAction(tabId: number, action: ActionRequest, appro
 }
 
 async function approveAction(approvalId: string): Promise<void> {
-  const tabId = state.activeTabId;
-  if (tabId === null) {
+  const approvalLocation = findApprovalById(approvalId);
+  if (!approvalLocation) {
     return;
   }
 
-  const tabState = getTabState(tabId);
-  const approval = tabState.approvals.find((entry) => entry.approvalId === approvalId);
-  if (!approval || approval.status !== "pending") {
+  const { tabId, approval } = approvalLocation;
+  if (approval.status !== "pending") {
     return;
+  }
+
+  if (state.activeTabId !== tabId) {
+    await focusTrackedTab(tabId);
   }
 
   replaceTabState(tabId, (current) => ({
@@ -936,16 +956,12 @@ async function approveAction(approvalId: string): Promise<void> {
 }
 
 async function rejectAction(approvalId: string): Promise<void> {
-  const tabId = state.activeTabId;
-  if (tabId === null) {
+  const approvalLocation = findApprovalById(approvalId);
+  if (!approvalLocation) {
     return;
   }
 
-  const tabState = getTabState(tabId);
-  const approval = tabState.approvals.find((entry) => entry.approvalId === approvalId);
-  if (!approval) {
-    return;
-  }
+  const { tabId, approval } = approvalLocation;
 
   const updated: ApprovalRequest = {
     ...approval,
@@ -1021,6 +1037,14 @@ function clearActiveTabLog(): void {
 }
 
 async function handleUiRequest(port: chrome.runtime.Port, request: UiRequest): Promise<void> {
+  const workflowContext =
+    "workflowId" in request || "workflowStepId" in request
+      ? {
+          ...(typeof (request as { workflowId?: string }).workflowId === "string" ? { workflowId: (request as { workflowId?: string }).workflowId } : {}),
+          ...(typeof (request as { workflowStepId?: string }).workflowStepId === "string" ? { workflowStepId: (request as { workflowStepId?: string }).workflowStepId } : {}),
+        }
+      : null;
+
   switch (request.kind) {
     case "get-state":
       await refreshKnownTabs();
@@ -1029,48 +1053,32 @@ async function handleUiRequest(port: chrome.runtime.Port, request: UiRequest): P
       void refreshSemanticStatus();
       return;
     case "scan-page":
-      await scanActiveTab(
-        request.mode,
-        request.workflowId || request.workflowStepId
-          ? {
-              ...(request.workflowId ? { workflowId: request.workflowId } : {}),
-              ...(request.workflowStepId ? { workflowStepId: request.workflowStepId } : {}),
-            }
-          : null,
-      );
+      if (resolveSuggestedRequestTabId(request) !== null) {
+        await scanTrackedTab(resolveSuggestedRequestTabId(request)!, request.mode, workflowContext);
+      } else {
+        await scanActiveTab(request.mode, workflowContext);
+      }
       return;
     case "list-interactive-elements":
-      await scanActiveTab(
-        "interactive",
-        request.workflowId || request.workflowStepId
-          ? {
-              ...(request.workflowId ? { workflowId: request.workflowId } : {}),
-              ...(request.workflowStepId ? { workflowStepId: request.workflowStepId } : {}),
-            }
-          : null,
-      );
+      if (resolveSuggestedRequestTabId(request) !== null) {
+        await scanTrackedTab(resolveSuggestedRequestTabId(request)!, "interactive", workflowContext);
+      } else {
+        await scanActiveTab("interactive", workflowContext);
+      }
       return;
     case "summarize-page":
-      await scanActiveTab(
-        "summary",
-        request.workflowId || request.workflowStepId
-          ? {
-              ...(request.workflowId ? { workflowId: request.workflowId } : {}),
-              ...(request.workflowStepId ? { workflowStepId: request.workflowStepId } : {}),
-            }
-          : null,
-      );
+      if (resolveSuggestedRequestTabId(request) !== null) {
+        await scanTrackedTab(resolveSuggestedRequestTabId(request)!, "summary", workflowContext);
+      } else {
+        await scanActiveTab("summary", workflowContext);
+      }
       return;
     case "suggest-next-actions":
-      await scanActiveTab(
-        "suggestions",
-        request.workflowId || request.workflowStepId
-          ? {
-              ...(request.workflowId ? { workflowId: request.workflowId } : {}),
-              ...(request.workflowStepId ? { workflowStepId: request.workflowStepId } : {}),
-            }
-          : null,
-      );
+      if (resolveSuggestedRequestTabId(request) !== null) {
+        await scanTrackedTab(resolveSuggestedRequestTabId(request)!, "suggestions", workflowContext);
+      } else {
+        await scanActiveTab("suggestions", workflowContext);
+      }
       return;
     case "request-action":
       await queueActionForApproval(request.action);

@@ -9,6 +9,7 @@ import type {
   ScanMode,
   WorkflowPlan,
   SuggestedRequest,
+  TabContext,
 } from "./types";
 
 type MessageKind =
@@ -54,24 +55,28 @@ export interface UiGetStateRequest extends MessageEnvelopeBase {
 export interface UiScanPageRequest extends MessageEnvelopeBase {
   kind: "scan-page";
   mode: ScanMode;
+  tabContext?: TabContext;
   workflowId?: string;
   workflowStepId?: string;
 }
 
 export interface UiListInteractiveRequest extends MessageEnvelopeBase {
   kind: "list-interactive-elements";
+  tabContext?: TabContext;
   workflowId?: string;
   workflowStepId?: string;
 }
 
 export interface UiSummarizePageRequest extends MessageEnvelopeBase {
   kind: "summarize-page";
+  tabContext?: TabContext;
   workflowId?: string;
   workflowStepId?: string;
 }
 
 export interface UiSuggestNextActionsRequest extends MessageEnvelopeBase {
   kind: "suggest-next-actions";
+  tabContext?: TabContext;
   workflowId?: string;
   workflowStepId?: string;
 }
@@ -79,6 +84,7 @@ export interface UiSuggestNextActionsRequest extends MessageEnvelopeBase {
 export interface UiRequestActionRequest extends MessageEnvelopeBase {
   kind: "request-action";
   action: ActionRequest;
+  tabContext?: TabContext;
 }
 
 export interface UiPlanWorkflowRequest extends MessageEnvelopeBase {
