@@ -24,6 +24,7 @@ export function buildTabContextFromSnapshot(snapshot: Pick<PageSnapshot, "tabId"
   return {
     tabId: snapshot.tabId,
     windowId: null,
+    browserTargetId: null,
     url: snapshot.url,
     title: snapshot.title,
     pageKind: snapshot.pageKind,
@@ -42,6 +43,7 @@ export function buildTabContextFromPageState(tabId: number, pageState: PageState
   return {
     tabId,
     windowId: null,
+    browserTargetId: null,
     url: pageState.url,
     title: pageState.title,
     pageKind: pageState.pageKind,
@@ -75,6 +77,7 @@ export function buildTabContextFromTrackedTab(tab: Pick<TrackedTabState, "tabId"
   return {
     tabId: tab.tabId,
     windowId: tab.windowId,
+    browserTargetId: null,
     url: tab.url,
     title: tab.title,
     pageKind: "unknown",
@@ -98,6 +101,7 @@ export function normalizeTabContext(value: unknown): TabContext | null {
   return {
     tabId,
     windowId: typeof value.windowId === "number" && Number.isFinite(value.windowId) ? value.windowId : null,
+    browserTargetId: typeof value.browserTargetId === "string" && value.browserTargetId.trim() ? value.browserTargetId : null,
     url: normalizeString(value.url),
     title: normalizeString(value.title),
     pageKind: isPageKind(value.pageKind) ? value.pageKind : "unknown",

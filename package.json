@@ -9,6 +9,7 @@
     "build": "node scripts/build.mjs",
     "bridge": "playwriter serve --host localhost",
     "dev": "node scripts/watch.mjs",
+    "native-mcp": "node dist/native/tab-mcp.js",
     "semantic": "node scripts/semantic-bridge.mjs",
     "test": "vitest run",
     "test:watch": "vitest",

@@ -24,6 +24,8 @@ flowchart LR
   BR --> CH[Existing Chrome session]
   BG --> SB[Stagehand semantic bridge on localhost]
   SB --> BR
+  BG --> NM[Native MCP facade on stdio]
+  NM --> BR
   BG --> SA[Site adapters and tab intelligence]
   BG --> UI
   BG --> ST[(chrome.storage.session)]
@@ -35,6 +37,7 @@ flowchart LR
 - `content/content-script.ts` inspects the DOM, captures page snapshots, observes navigation/mutations, and executes approved page actions.
 - `Playwriter` provides the live Chrome bridge on `localhost:19988`; CBC polls it for bridge health and session attachment.
 - `Stagehand` provides the optional semantic bridge on `localhost:19989`; CBC uses it to derive higher-quality next-action suggestions when the bridge is enabled.
+- `native/tab-mcp.ts` provides an optional local MCP facade that speaks the same `TabContext` contract to external Codex clients.
 - `shared/site-adapters.ts` recognizes common site-specific experiences and produces adapter-aware guidance for Google sign-in, Google Drive, Google Docs, and LinkedIn.
 - `shared/tab-intelligence.ts` powers the MCP-style cross-tab search and ranking layer used by the tab inventory panel.
 - `ui/popup/*` provides the quick interaction surface.
@@ -58,6 +61,15 @@ The UI includes quick actions and a command box. Supported examples:
 - `refresh`
 
 Click, type, select, and submit actions always go through an approval queue first.
+
+## Visible Browser Control
+
+CBC is meant to work against the Chrome window you already have open and can see on your screen.
+
+- The extension should be loaded in that visible Chrome session.
+- Live actions should target the current browser window, not a separate QA browser spawned by Playwright.
+- If you see a second Chrome window during testing, treat it as a test harness, not the live browser session.
+- The side panel and popup are the control surfaces for the visible browser window.
 
 ## Workflow Planning
 
@@ -128,6 +140,12 @@ For example, `STAGEHAND_MODEL=openai/gpt-4.1-mini` with `OPENAI_API_KEY` set wil
 npm run build
 ```
 
+If you want the native tab-context MCP facade for an external Codex client, start it in another terminal after building:
+
+```bash
+npm run native-mcp
+```
+
 5. Open Chrome and go to `chrome://extensions`.
 
 6. Turn on Developer mode.
@@ -146,6 +164,8 @@ npm run dev
 
 That keeps rebuilding the extension bundle and copied assets. After each rebuild, reload the unpacked extension in Chrome.
 
+When testing live browser behavior, keep the visible Chrome window in front and use that session as the source of truth. Do not rely on a separate automation browser window for real browser control.
+
 If you are working on live-session attachment, keep the Playwriter bridge running in another terminal:
 
 ```bash
@@ -163,6 +183,7 @@ Helpful extra commands:
 ```bash
 npm run typecheck
 npm test
+npm run native-mcp
 ```
 
 ## Build Output
@@ -180,6 +201,7 @@ Important output files:
 - `dist/sidepanel/index.html`
 - `dist/sidepanel/panel.js`
 - `dist/sidepanel/panel.css`
+- `dist/native/tab-mcp.js`
 - `dist/icons/icon-16.png`
 - `dist/icons/icon-32.png`
 - `dist/icons/icon-48.png`

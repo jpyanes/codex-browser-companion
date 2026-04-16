@@ -96,6 +96,7 @@
     return {
       tabId: snapshot.tabId,
       windowId: null,
+      browserTargetId: null,
       url: snapshot.url,
       title: snapshot.title,
       pageKind: snapshot.pageKind,
@@ -112,6 +113,7 @@
     return {
       tabId,
       windowId: null,
+      browserTargetId: null,
       url: pageState.url,
       title: pageState.title,
       pageKind: pageState.pageKind,
@@ -141,6 +143,7 @@
     return {
       tabId: tab.tabId,
       windowId: tab.windowId,
+      browserTargetId: null,
       url: tab.url,
       title: tab.title,
       pageKind: "unknown",

@@ -27,6 +27,7 @@ export interface WorkflowRequestContext {
 export interface TabContext {
   tabId: number;
   windowId: number | null;
+  browserTargetId?: string | null;
   url: string;
   title: string;
   pageKind: PageKind;

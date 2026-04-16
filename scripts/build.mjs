@@ -50,6 +50,15 @@ function sharedEsbuildOptions(overrides = {}) {
   };
 }
 
+function sharedNodeEsbuildOptions(overrides = {}) {
+  return sharedEsbuildOptions({
+    platform: "node",
+    target: ["node20"],
+    external: ["playwriter", "playwriter/*", "@modelcontextprotocol/sdk", "@modelcontextprotocol/sdk/*"],
+    ...overrides,
+  });
+}
+
 async function buildBackground({ watch = false } = {}) {
   const options = sharedEsbuildOptions({
     entryPoints: [entryPath("background", "service-worker.ts")],
@@ -106,21 +115,38 @@ async function buildSidepanel({ watch = false } = {}) {
   return build(options);
 }
 
+async function buildNativeMcp({ watch = false } = {}) {
+  const options = sharedNodeEsbuildOptions({
+    entryPoints: [entryPath("native", "tab-mcp.ts")],
+    outfile: distPath("native", "tab-mcp.js"),
+    format: "esm",
+  });
+
+  if (watch) {
+    return context(options);
+  }
+
+  return build(options);
+}
+
 export async function buildProject({ watch = false } = {}) {
   if (!watch) {
     await rm(distDir, { recursive: true, force: true });
     await ensureDir(distDir);
+    await ensureDir(distPath("native"));
     await Promise.all([writeManifest(), copyHtmlTemplates(), copyIconAssets()]);
     await Promise.all([
       buildBackground(),
       buildContent(),
       buildPopup(),
       buildSidepanel(),
+      buildNativeMcp(),
     ]);
     return;
   }
 
   await ensureDir(distDir);
+  await ensureDir(distPath("native"));
   await Promise.all([writeManifest(), copyHtmlTemplates(), copyIconAssets()]);
 
   const contexts = await Promise.all([
@@ -128,6 +154,7 @@ export async function buildProject({ watch = false } = {}) {
     buildContent({ watch: true }),
     buildPopup({ watch: true }),
     buildSidepanel({ watch: true }),
+    buildNativeMcp({ watch: true }),
   ]);
 
   await Promise.all(contexts.map((buildContext) => buildContext.watch()));

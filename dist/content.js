@@ -83,6 +83,7 @@
     return {
       tabId: snapshot.tabId,
       windowId: null,
+      browserTargetId: null,
       url: snapshot.url,
       title: snapshot.title,
       pageKind: snapshot.pageKind,
