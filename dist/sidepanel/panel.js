@@ -47,6 +47,52 @@
     return (/* @__PURE__ */ new Date()).toISOString();
   }
 
+  // src/shared/live-takeover.ts
+  function liveTakeoverStatusTone(status) {
+    switch (status) {
+      case "connected":
+        return "success";
+      case "connecting":
+        return "warning";
+      case "error":
+      case "disconnected":
+        return "danger";
+      case "disabled":
+        return "neutral";
+    }
+  }
+  function liveTakeoverStatusLabel(status) {
+    switch (status) {
+      case "connected":
+        return "Connected";
+      case "connecting":
+        return "Connecting";
+      case "error":
+        return "Error";
+      case "disconnected":
+        return "Disconnected";
+      case "disabled":
+        return "Disabled";
+    }
+  }
+  function summarizeLiveTakeoverState(state) {
+    if (!state.enabled) {
+      return "Live takeover mode is disabled. Enable it to attach the visible Chrome tab to the local command queue.";
+    }
+    if (state.status === "error") {
+      return state.lastError?.message ?? `The live takeover bridge at ${state.endpoint} reported an error.`;
+    }
+    if (state.status === "disconnected") {
+      return `No live takeover bridge detected at ${state.endpoint}. Run \`npm run live-takeover\` to start one.`;
+    }
+    if (state.status === "connecting") {
+      return `Live takeover bridge is up and waiting for the visible Chrome tab to heartbeat.`;
+    }
+    const tabLabel = state.activeTitle || state.activeUrl || `tab ${state.activeTabId ?? "unknown"}`;
+    const queueLabel = state.queueLength === 1 ? "1 queued command" : `${state.queueLength} queued commands`;
+    return `Attached to ${tabLabel} with ${queueLabel}.`;
+  }
+
   // src/shared/action-policy.ts
   var DANGEROUS_KEYWORDS = [
     "delete",
@@ -1366,6 +1412,48 @@
     </section>
   `;
   }
+  function renderLiveTakeoverPanel(liveTakeover) {
+    if (!liveTakeover) {
+      return `<section class="panel panel--takeover"><p class="empty">No live takeover state available yet.</p></section>`;
+    }
+    const tone = liveTakeoverStatusTone(liveTakeover.status);
+    const label = liveTakeoverStatusLabel(liveTakeover.status);
+    const toggleLabel = liveTakeover.enabled ? "Disable live takeover" : "Enable live takeover";
+    return `
+    <section class="panel panel--takeover">
+      <div class="section-head">
+        <h2>Live takeover</h2>
+        <span class="section-note">Visible-browser queue and command loop</span>
+      </div>
+      <div class="bridge-card takeover-card">
+        <div class="bridge-card__top">
+          <div>
+            <div class="bridge-card__label">Takeover state</div>
+            <div class="bridge-card__summary">${escapeHtml(summarizeLiveTakeoverState(liveTakeover))}</div>
+          </div>
+          <span class="status-chip status-chip--${tone}">${escapeHtml(label)}</span>
+        </div>
+        <div class="bridge-card__meta">
+          <span>Endpoint: ${escapeHtml(liveTakeover.endpoint)}</span>
+          <span>Enabled: ${liveTakeover.enabled ? "yes" : "no"}</span>
+          <span>Active tab: ${escapeHtml(liveTakeover.activeTitle || liveTakeover.activeUrl || (liveTakeover.activeTabId !== null ? `tab ${liveTakeover.activeTabId}` : "unknown"))}</span>
+          <span>Queue: ${liveTakeover.queueLength}</span>
+          <span>Last heartbeat: ${liveTakeover.lastHeartbeat ? escapeHtml(formatTime(liveTakeover.lastHeartbeat)) : "none"}</span>
+          <span>Checked: ${liveTakeover.checkedAt ? escapeHtml(formatTime(liveTakeover.checkedAt)) : "unknown"}</span>
+        </div>
+        ${liveTakeover.lastError ? `
+              <div class="bridge-card__error">
+                <div class="bridge-card__error-title">${escapeHtml(liveTakeover.lastError.message)}</div>
+                <div class="bridge-card__error-meta">${escapeHtml(liveTakeover.lastError.code)}</div>
+              </div>` : ""}
+        <div class="takeover-card__actions">
+          <button class="btn btn--ghost" data-action="refresh-live-takeover" type="button">Refresh takeover</button>
+          <button class="btn btn--primary" data-action="toggle-live-takeover" type="button">${escapeHtml(toggleLabel)}</button>
+        </div>
+      </div>
+    </section>
+  `;
+  }
   function renderSemanticPanel(semantic) {
     if (!semantic) {
       return `<section class="panel panel--semantic"><p class="empty">No semantic bridge state available yet.</p></section>`;
@@ -1566,13 +1654,14 @@
     </section>
   `;
   }
-  function renderPanels(tab, snapshot, bridge, semantic, workflow, tabs, activeTabId, tabSearchQuery, mode) {
+  function renderPanels(tab, snapshot, bridge, liveTakeover, semantic, workflow, tabs, activeTabId, tabSearchQuery, mode) {
     const maxInteractive = mode === "popup" ? 6 : 14;
     const maxLogs = mode === "popup" ? 6 : 12;
     return `
     ${renderSummary(tab, snapshot, mode)}
     ${renderTabOrchestrationPanel(tabs, activeTabId, mode, tabSearchQuery)}
     ${renderBridgePanel(bridge)}
+    ${renderLiveTakeoverPanel(liveTakeover)}
     ${renderSemanticPanel(semantic)}
     ${renderWorkflowPanel(workflow)}
     <section class="panel">
@@ -1699,6 +1788,8 @@
             <button class="btn btn--ghost" data-action="scan-page" data-mode="summary" type="button">Summarize</button>
             <button class="btn btn--ghost" data-action="scan-page" data-mode="suggestions" type="button">Suggest next</button>
             <button class="btn btn--ghost" data-action="refresh-bridge" type="button">Refresh bridge</button>
+            <button class="btn btn--ghost" data-action="refresh-live-takeover" type="button">Refresh takeover</button>
+            <button class="btn btn--ghost" data-action="toggle-live-takeover" type="button">Toggle takeover</button>
             <button class="btn btn--ghost" data-action="refresh-semantic" type="button">Refresh semantic</button>
             <button class="btn btn--ghost" data-action="refresh-tabs" type="button">Refresh tabs</button>
             <button class="btn btn--ghost" data-action="open-sidepanel" type="button">Open side panel</button>
@@ -1789,6 +1880,10 @@
             this.send({ kind: "scan-page", mode });
           } else if (action === "refresh-bridge") {
             this.send({ kind: "refresh-bridge" });
+          } else if (action === "refresh-live-takeover") {
+            this.send({ kind: "refresh-live-takeover" });
+          } else if (action === "toggle-live-takeover") {
+            this.send({ kind: "toggle-live-takeover" });
           } else if (action === "refresh-semantic") {
             this.send({ kind: "refresh-semantic" });
           } else if (action === "refresh-tabs") {
@@ -1963,6 +2058,7 @@
         activeTab,
         snapshot,
         this.state?.bridge ?? null,
+        this.state?.liveTakeover ?? null,
         this.state?.semantic ?? null,
         this.state?.workflow ?? null,
         Object.values(this.state?.tabs ?? {}),

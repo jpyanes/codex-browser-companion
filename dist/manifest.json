@@ -2,14 +2,24 @@
   "manifest_version": 3,
   "name": "Codex Browser Companion",
   "version": "0.1.0",
-  "description": "A Codex companion Chrome extension for inspecting the active tab, surfacing structured page context, and approving safe browser actions.",
+  "description": "A Codex companion Chrome extension for inspecting the active tab, surfacing structured page context, and supporting a visible live takeover mode with approval-gated browser actions.",
   "minimum_chrome_version": "114",
   "permissions": ["activeTab", "scripting", "storage", "tabs", "sidePanel"],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
   "host_permissions": [
+    "<all_urls>",
     "http://127.0.0.1:19988/*",
     "http://localhost:19988/*",
     "http://127.0.0.1:19989/*",
-    "http://localhost:19989/*"
+    "http://localhost:19989/*",
+    "http://127.0.0.1:47123/*",
+    "http://localhost:47123/*"
   ],
   "icons": {
     "16": "icons/icon-16.png",

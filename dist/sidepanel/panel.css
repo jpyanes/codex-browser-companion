@@ -203,6 +203,14 @@ input {
       rgba(8, 15, 28, 0.94));
   border-color: rgba(94, 234, 212, 0.16);
 }
+.panel--takeover {
+  background:
+    linear-gradient(
+      180deg,
+      rgba(18, 17, 29, 0.96),
+      rgba(10, 10, 18, 0.94));
+  border-color: rgba(245, 158, 11, 0.18);
+}
 .panel--semantic {
   background:
     linear-gradient(
@@ -614,6 +622,11 @@ input {
   color: #ffe5b0;
   font-size: 12px;
   line-height: 1.55;
+}
+.takeover-card__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 .excerpt,
 .log__details,

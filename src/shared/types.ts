@@ -11,6 +11,8 @@ export type WorkflowStepStatus = "pending" | "queued" | "completed" | "blocked" 
 export type WorkflowStepSource = "command" | "planner" | "memory";
 export type SiteAdapterKind = "social-feed" | "document-editor" | "workspace-login" | "workspace-app" | "general";
 export type UserInterventionKind = "login" | "payment";
+export type LiveTakeoverConnectionState = "disabled" | "disconnected" | "connecting" | "connected" | "error";
+export type LiveTakeoverCommandType = "snapshot" | "click" | "fill" | "press" | "navigate";
 
 export interface BoxRect {
   x: number;
@@ -22,6 +24,39 @@ export interface BoxRect {
 export interface WorkflowRequestContext {
   workflowId?: string;
   workflowStepId?: string;
+}
+
+export interface LiveTakeoverActiveTab {
+  tabId: number | null;
+  windowId: number | null;
+  url: string | null;
+  title: string | null;
+  ts: string | null;
+}
+
+export interface LiveTakeoverCommand {
+  id: string;
+  type: LiveTakeoverCommandType;
+  payload: Record<string, unknown>;
+  createdAt: string;
+  claimedAt?: string;
+  tabId?: number | null;
+  url?: string | null;
+}
+
+export interface LiveTakeoverCommandResult {
+  commandId: string;
+  ok: boolean;
+  result: unknown;
+  ts: string;
+}
+
+export interface LiveTakeoverHealthSnapshot {
+  startedAt: string;
+  lastHeartbeat: string | null;
+  activeTab: LiveTakeoverActiveTab;
+  queueLength: number;
+  checkedAt: string;
 }
 
 export interface TabContext {
@@ -176,6 +211,8 @@ export interface SiteAdapterSummary {
 
 export type ActionKind =
   | "click"
+  | "fill"
+  | "press"
   | "type"
   | "select"
   | "scroll"
@@ -418,6 +455,21 @@ export interface SemanticState {
   lastError: AppError | null;
 }
 
+export interface LiveTakeoverState {
+  endpoint: string;
+  enabled: boolean;
+  status: LiveTakeoverConnectionState;
+  hasBeenInitialized: boolean;
+  activeTabId: number | null;
+  activeWindowId: number | null;
+  activeUrl: string | null;
+  activeTitle: string | null;
+  queueLength: number;
+  checkedAt: string | null;
+  lastHeartbeat: string | null;
+  lastError: AppError | null;
+}
+
 export interface WorkflowPlanStep {
   stepId: string;
   title: string;
@@ -512,6 +564,7 @@ export interface ExtensionState {
   tabs: Record<number, TrackedTabState>;
   bridge: BridgeState;
   semantic: SemanticState;
+  liveTakeover: LiveTakeoverState;
   workflow: WorkflowState;
   status: AssistantConnectionState;
   lastUpdatedAt: string;

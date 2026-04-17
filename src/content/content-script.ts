@@ -1,8 +1,16 @@
-import { PAGE_MUTATION_DEBOUNCE_MS } from "../shared/constants";
+import { LIVE_TAKEOVER_POLL_INTERVAL_MS, PAGE_MUTATION_DEBOUNCE_MS } from "../shared/constants";
 import { capturePageState, createActionResult, createSnapshotForMode, getActionScrollAmount, getElementTextSnapshot, isSensitiveElement } from "../shared/dom";
 import { normalizeError, nowIso } from "../shared/logger";
 import { isContentRequest } from "../shared/messages";
-import type { ActionRequest, NavigationMode, PageSnapshot } from "../shared/types";
+import {
+  getNextLiveTakeoverCommand,
+  postLiveTakeoverHeartbeat,
+  postLiveTakeoverResult,
+} from "../shared/live-takeover-client";
+import type { ActionKind, ActionRequest, ActionResult, NavigationMode, PageSnapshot } from "../shared/types";
+import type { LiveTakeoverCommand, LiveTakeoverCommandResult } from "../shared/types";
+import type { ContentTargetPayload } from "../shared/messages";
+import type { ContentLiveTakeoverContextResponse } from "../shared/messages";
 
 declare global {
   interface Window {
@@ -16,6 +24,15 @@ interface ContentRuntimeState {
   registry: Map<string, HTMLElement>;
   lastSnapshot: PageSnapshot | null;
   mutationTimer: number | null;
+  liveTakeover: {
+    enabled: boolean;
+    endpoint: string | null;
+    tabId: number | null;
+    windowId: number | null;
+    timer: number | null;
+    inFlight: boolean;
+    lastHeartbeat: string | null;
+  };
 }
 
 const runtimeState: ContentRuntimeState = (window.__codexBrowserCompanionContent ??= {
@@ -24,6 +41,15 @@ const runtimeState: ContentRuntimeState = (window.__codexBrowserCompanionContent
   registry: new Map(),
   lastSnapshot: null,
   mutationTimer: null,
+  liveTakeover: {
+    enabled: false,
+    endpoint: null,
+    tabId: null,
+    windowId: null,
+    timer: null,
+    inFlight: false,
+    lastHeartbeat: null,
+  },
 });
 
 function makeId(prefix: string): string {
@@ -57,6 +83,199 @@ async function broadcastPageState(reason: "initial" | "mutation" | "navigation" 
     state,
     reason,
   });
+}
+
+async function requestLiveTakeoverContext(): Promise<ContentLiveTakeoverContextResponse | null> {
+  try {
+    const response = await chrome.runtime.sendMessage({ kind: "get-live-takeover-context" });
+    if (
+      response &&
+      typeof response === "object" &&
+      response !== null &&
+      (response as { kind?: unknown }).kind === "live-takeover-context"
+    ) {
+      return response as ContentLiveTakeoverContextResponse;
+    }
+  } catch {
+    // The background worker may still be booting. Retry from bootstrap.
+  }
+
+  return null;
+}
+
+async function bootstrapLiveTakeoverFromContext(attempt = 0): Promise<void> {
+  if (runtimeState.liveTakeover.enabled) {
+    return;
+  }
+
+  const context = await requestLiveTakeoverContext();
+  if (!context) {
+    if (attempt < 2) {
+      window.setTimeout(() => {
+        void bootstrapLiveTakeoverFromContext(attempt + 1);
+      }, 250);
+    }
+    return;
+  }
+
+  if (context.enabled && context.shouldStart && context.tabId !== null) {
+    startLiveTakeoverLoop(context.endpoint, context.tabId, context.windowId);
+    return;
+  }
+
+  if (!context.enabled) {
+    stopLiveTakeoverLoop();
+  }
+}
+
+function stopLiveTakeoverLoop(): void {
+  if (runtimeState.liveTakeover.timer !== null) {
+    clearInterval(runtimeState.liveTakeover.timer);
+    runtimeState.liveTakeover.timer = null;
+  }
+  runtimeState.liveTakeover.enabled = false;
+  runtimeState.liveTakeover.endpoint = null;
+  runtimeState.liveTakeover.tabId = null;
+  runtimeState.liveTakeover.windowId = null;
+  runtimeState.liveTakeover.inFlight = false;
+}
+
+async function executeLiveTakeoverCommand(tabId: number, command: LiveTakeoverCommand): Promise<LiveTakeoverCommandResult> {
+  const startedAt = nowIso();
+
+  switch (command.type) {
+    case "snapshot": {
+      const mode = command.payload?.mode === "interactive" || command.payload?.mode === "summary" || command.payload?.mode === "suggestions" ? command.payload.mode : "full";
+      const capture = createSnapshotForMode(document, mode, getNavigationMode());
+      const snapshot = capture.snapshot;
+      snapshot.tabId = tabId;
+      runtimeState.registry = capture.registry;
+      runtimeState.lastSnapshot = snapshot;
+      return {
+        commandId: command.id,
+        ok: true,
+        result: {
+          snapshotId: snapshot.snapshotId,
+          summary: snapshot.summary,
+          pageKind: snapshot.pageKind,
+          capturedAt: snapshot.capturedAt,
+        },
+        ts: startedAt,
+      };
+    }
+    case "click": {
+      const result = performDirectClick(tabId, buildDirectTargetPayload(command.payload ?? {}));
+      return {
+        commandId: command.id,
+        ok: true,
+        result,
+        ts: startedAt,
+      };
+    }
+    case "fill": {
+      const fillPayload: DirectFillPayload = {
+        ...buildDirectTargetPayload(command.payload ?? {}),
+        value: typeof command.payload?.value === "string" ? command.payload.value : "",
+        ...(typeof command.payload?.clearBeforeTyping === "boolean" ? { clearBeforeTyping: command.payload.clearBeforeTyping } : {}),
+      };
+      const result = performDirectFill(tabId, fillPayload);
+      return {
+        commandId: command.id,
+        ok: true,
+        result,
+        ts: startedAt,
+      };
+    }
+    case "press": {
+      const pressPayload: DirectPressPayload = {
+        ...buildDirectTargetPayload(command.payload ?? {}),
+        ...(typeof command.payload?.key === "string" ? { key: command.payload.key } : {}),
+        ...(typeof command.payload?.submitForm === "boolean" ? { submitForm: command.payload.submitForm } : {}),
+      };
+      const result = performDirectPress(tabId, pressPayload);
+      return {
+        commandId: command.id,
+        ok: true,
+        result,
+        ts: startedAt,
+      };
+    }
+    case "navigate": {
+      const url = typeof command.payload?.url === "string" && command.payload.url.trim() ? command.payload.url : "about:blank";
+      return {
+        commandId: command.id,
+        ok: true,
+        result: { navigatedTo: url },
+        ts: startedAt,
+      };
+    }
+  }
+}
+
+async function runLiveTakeoverCycle(): Promise<void> {
+  const config = runtimeState.liveTakeover;
+  if (!config.enabled || !config.endpoint || config.tabId === null || config.inFlight) {
+    return;
+  }
+
+  config.inFlight = true;
+  const heartbeatTs = nowIso();
+  try {
+    await postLiveTakeoverHeartbeat(
+      config.endpoint,
+      {
+        tabId: config.tabId,
+        windowId: config.windowId,
+        url: location.href,
+        title: document.title || null,
+        ts: heartbeatTs,
+      },
+      { keepalive: true },
+    );
+    config.lastHeartbeat = heartbeatTs;
+
+    const command = await getNextLiveTakeoverCommand(config.endpoint, config.tabId, location.href);
+    if (command) {
+      if (command.type === "navigate") {
+        const navigatedTo = typeof command.payload?.url === "string" && command.payload.url.trim() ? command.payload.url : "about:blank";
+        await postLiveTakeoverResult(
+          config.endpoint,
+          {
+            commandId: command.id,
+            ok: true,
+            result: { navigatedTo },
+            ts: nowIso(),
+          },
+          { keepalive: true },
+        );
+        location.href = navigatedTo;
+        return;
+      }
+
+      const result = await executeLiveTakeoverCommand(config.tabId, command);
+      await postLiveTakeoverResult(config.endpoint, result, { keepalive: true });
+    }
+  } catch {
+    // Keep the loop alive; the background bridge will surface errors through health polling.
+  } finally {
+    config.inFlight = false;
+  }
+}
+
+function startLiveTakeoverLoop(endpoint: string, tabId: number, windowId: number | null): void {
+  runtimeState.liveTakeover.enabled = true;
+  runtimeState.liveTakeover.endpoint = endpoint;
+  runtimeState.liveTakeover.tabId = tabId;
+  runtimeState.liveTakeover.windowId = windowId;
+
+  if (runtimeState.liveTakeover.timer !== null) {
+    clearInterval(runtimeState.liveTakeover.timer);
+  }
+
+  void runLiveTakeoverCycle();
+  runtimeState.liveTakeover.timer = window.setInterval(() => {
+    void runLiveTakeoverCycle();
+  }, LIVE_TAKEOVER_POLL_INTERVAL_MS);
 }
 
 function installHistoryHooks(): void {
@@ -184,6 +403,46 @@ function resolveSelectorByText(selector: string): HTMLElement | null {
   return null;
 }
 
+function resolveElementByLabel(label: string): HTMLElement | null {
+  const comparable = normalizeComparable(label);
+  if (!comparable) {
+    return null;
+  }
+
+  const candidates = Array.from(
+    document.querySelectorAll<HTMLElement>(
+      [
+        "button",
+        "a[href]",
+        "input:not([type='hidden'])",
+        "select",
+        "textarea",
+        "summary",
+        "[role='button']",
+        "[role='link']",
+        "[contenteditable='true']",
+      ].join(","),
+    ),
+  ).filter((element) => element instanceof HTMLElement);
+
+  for (const element of candidates) {
+    const haystack = normalizeComparable(
+      [
+        element.getAttribute("aria-label") ?? "",
+        element.getAttribute("title") ?? "",
+        element.getAttribute("placeholder") ?? "",
+        getElementTextSnapshot(element),
+      ].join(" "),
+    );
+
+    if (haystack.includes(comparable)) {
+      return element;
+    }
+  }
+
+  return resolveSelectorByText(label);
+}
+
 function resolveSelectorToElement(selector: string): HTMLElement | null {
   const normalized = selector.trim();
   if (!normalized) {
@@ -225,7 +484,167 @@ function resolveSelectorToElement(selector: string): HTMLElement | null {
     return textMatch;
   }
 
+  const labelMatch = resolveElementByLabel(normalized);
+  if (labelMatch) {
+    return labelMatch;
+  }
+
   return null;
+}
+
+type DirectTargetPayload = ContentTargetPayload;
+type DirectFillPayload = ContentTargetPayload & { value: string; clearBeforeTyping?: boolean };
+type DirectPressPayload = ContentTargetPayload & { key?: string; submitForm?: boolean };
+
+function buildDirectTargetPayload(payload: Record<string, unknown>): DirectTargetPayload {
+  const target: DirectTargetPayload = {};
+  if (typeof payload.selector === "string") {
+    target.selector = payload.selector;
+  }
+  if (typeof payload.bridgeId === "string") {
+    target.bridgeId = payload.bridgeId;
+  }
+  if (typeof payload.label === "string") {
+    target.label = payload.label;
+  }
+
+  return target;
+}
+
+function resolveTargetFromPayload(payload: DirectTargetPayload): HTMLElement | null {
+  if (typeof payload.bridgeId === "string" && payload.bridgeId.trim()) {
+    const bridgeTarget = resolveRegistryElement(payload.bridgeId);
+    if (bridgeTarget) {
+      return bridgeTarget;
+    }
+  }
+
+  if (typeof payload.selector === "string" && payload.selector.trim()) {
+    const selectorTarget = resolveSelectorToElement(payload.selector);
+    if (selectorTarget) {
+      return selectorTarget;
+    }
+  }
+
+  if (typeof payload.label === "string" && payload.label.trim()) {
+    const labelTarget = resolveElementByLabel(payload.label);
+    if (labelTarget) {
+      return labelTarget;
+    }
+  }
+
+  return null;
+}
+
+function createDirectActionResult(
+  tabId: number,
+  kind: Extract<ActionKind, "click" | "fill" | "press">,
+  success: boolean,
+  message: string,
+  details?: string,
+): ActionResult {
+  return {
+    actionId: makeId(`live-${kind}`),
+    approvalId: undefined,
+    tabId,
+    kind,
+    success,
+    message,
+    executedAt: nowIso(),
+    details,
+  };
+}
+
+function dispatchKeyboardEvent(target: HTMLElement, key: string, type: "keydown" | "keypress" | "keyup"): void {
+  const code = key.length === 1 ? `Key${key.toUpperCase()}` : key;
+  target.dispatchEvent(
+    new KeyboardEvent(type, {
+      key,
+      code,
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+    }),
+  );
+}
+
+function performDirectClick(tabId: number, payload: DirectTargetPayload): ActionResult {
+  const target = resolveTargetFromPayload(payload);
+  if (!target) {
+    throw new Error("The target element is no longer available.");
+  }
+
+  if (isSensitiveElement(target)) {
+    throw new Error("Sensitive fields are blocked.");
+  }
+
+  registerResolvedElement(target);
+  target.focus?.();
+  target.click();
+  schedulePageStateBroadcast("mutation");
+  return createDirectActionResult(tabId, "click", true, "Clicked the selected element.", `Target: ${target.tagName.toLowerCase()}.`);
+}
+
+function performDirectFill(tabId: number, payload: DirectFillPayload): ActionResult {
+  const value = payload.value;
+  const target = resolveTargetFromPayload(payload);
+  if (!target || !(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target.isContentEditable)) {
+    throw new Error("The target field is no longer available.");
+  }
+
+  if (isSensitiveElement(target)) {
+    throw new Error("Sensitive fields are blocked.");
+  }
+
+  registerResolvedElement(target);
+  if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
+    target.focus();
+    const nextValue = payload.clearBeforeTyping === false ? `${getFieldValue(target)}${value}` : value;
+    setFieldValue(target, nextValue);
+  } else {
+    target.focus();
+    if (payload.clearBeforeTyping !== false) {
+      target.textContent = "";
+    }
+    if (document.queryCommandSupported?.("insertText")) {
+      document.execCommand("insertText", false, value);
+    } else {
+      target.textContent = `${target.textContent ?? ""}${value}`;
+    }
+    target.dispatchEvent(new Event("input", { bubbles: true, cancelable: true, composed: true }));
+  }
+
+  schedulePageStateBroadcast("mutation");
+  return createDirectActionResult(tabId, "fill", true, "Typed text into the selected field.", `Inserted ${value.length} characters.`);
+}
+
+function performDirectPress(tabId: number, payload: DirectPressPayload): ActionResult {
+  const key = typeof payload.key === "string" && payload.key.trim() ? payload.key : "Enter";
+  const target = resolveTargetFromPayload(payload) ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
+  if (!target) {
+    throw new Error("The target element is no longer available.");
+  }
+
+  registerResolvedElement(target);
+  target.focus?.();
+  dispatchKeyboardEvent(target, key, "keydown");
+  dispatchKeyboardEvent(target, key, "keypress");
+  dispatchKeyboardEvent(target, key, "keyup");
+
+  const shouldSubmit = key === "Enter" && payload.submitForm !== false;
+  const form = shouldSubmit ? target.closest("form") : null;
+  if (form instanceof HTMLFormElement) {
+    if (typeof form.requestSubmit === "function") {
+      form.requestSubmit();
+    } else {
+      form.submit();
+    }
+    schedulePageStateBroadcast("navigation");
+    return createDirectActionResult(tabId, "press", true, `Pressed ${key} and submitted the active form.`, `Target: ${target.tagName.toLowerCase()}.`);
+  }
+
+  schedulePageStateBroadcast("mutation");
+  return createDirectActionResult(tabId, "press", true, `Pressed ${key}.`, `Target: ${target.tagName.toLowerCase()}.`);
 }
 
 function resolveActionTarget(action: ActionRequest): HTMLElement | null {
@@ -368,6 +787,7 @@ function bootstrap(): void {
   installHistoryHooks();
   installMutationObserver();
   void broadcastPageState("initial");
+  void bootstrapLiveTakeoverFromContext();
 
   chrome.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
     if (!isContentRequest(message)) {
@@ -381,6 +801,23 @@ function bootstrap(): void {
           sendResponse({
             kind: "ping",
             state,
+          });
+          return;
+        }
+        case "set-live-takeover": {
+          if (message.enabled) {
+            startLiveTakeoverLoop(message.endpoint, message.tabId, message.windowId);
+          } else {
+            stopLiveTakeoverLoop();
+          }
+
+          sendResponse({
+            kind: "live-takeover-state",
+            enabled: message.enabled,
+            endpoint: message.endpoint,
+            tabId: message.tabId,
+            windowId: message.windowId,
+            lastHeartbeat: runtimeState.liveTakeover.lastHeartbeat,
           });
           return;
         }
@@ -409,6 +846,33 @@ function bootstrap(): void {
         }
         case "perform-action": {
           const result = await performAction(message.action);
+          runtimeState.lastSnapshot = createSnapshotForMode(document, "summary", getNavigationMode()).snapshot;
+          sendResponse({
+            kind: "action-result",
+            result,
+          });
+          return;
+        }
+        case "click": {
+          const result = performDirectClick(message.tabId, message.payload);
+          runtimeState.lastSnapshot = createSnapshotForMode(document, "summary", getNavigationMode()).snapshot;
+          sendResponse({
+            kind: "action-result",
+            result,
+          });
+          return;
+        }
+        case "fill": {
+          const result = performDirectFill(message.tabId, message.payload);
+          runtimeState.lastSnapshot = createSnapshotForMode(document, "summary", getNavigationMode()).snapshot;
+          sendResponse({
+            kind: "action-result",
+            result,
+          });
+          return;
+        }
+        case "press": {
+          const result = performDirectPress(message.tabId, message.payload);
           runtimeState.lastSnapshot = createSnapshotForMode(document, "summary", getNavigationMode()).snapshot;
           sendResponse({
             kind: "action-result",

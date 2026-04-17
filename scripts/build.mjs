@@ -129,11 +129,40 @@ async function buildNativeMcp({ watch = false } = {}) {
   return build(options);
 }
 
+async function buildLiveTakeoverServer({ watch = false } = {}) {
+  const options = sharedNodeEsbuildOptions({
+    entryPoints: [entryPath("live-takeover", "server.ts")],
+    outfile: distPath("live-takeover", "server.js"),
+    format: "esm",
+  });
+
+  if (watch) {
+    return context(options);
+  }
+
+  return build(options);
+}
+
+async function buildLiveTakeoverMcp({ watch = false } = {}) {
+  const options = sharedNodeEsbuildOptions({
+    entryPoints: [entryPath("native", "live-takeover-mcp.ts")],
+    outfile: distPath("native", "live-takeover-mcp.js"),
+    format: "esm",
+  });
+
+  if (watch) {
+    return context(options);
+  }
+
+  return build(options);
+}
+
 export async function buildProject({ watch = false } = {}) {
   if (!watch) {
     await rm(distDir, { recursive: true, force: true });
     await ensureDir(distDir);
     await ensureDir(distPath("native"));
+    await ensureDir(distPath("live-takeover"));
     await Promise.all([writeManifest(), copyHtmlTemplates(), copyIconAssets()]);
     await Promise.all([
       buildBackground(),
@@ -141,12 +170,15 @@ export async function buildProject({ watch = false } = {}) {
       buildPopup(),
       buildSidepanel(),
       buildNativeMcp(),
+      buildLiveTakeoverServer(),
+      buildLiveTakeoverMcp(),
     ]);
     return;
   }
 
   await ensureDir(distDir);
   await ensureDir(distPath("native"));
+  await ensureDir(distPath("live-takeover"));
   await Promise.all([writeManifest(), copyHtmlTemplates(), copyIconAssets()]);
 
   const contexts = await Promise.all([
@@ -155,6 +187,8 @@ export async function buildProject({ watch = false } = {}) {
     buildPopup({ watch: true }),
     buildSidepanel({ watch: true }),
     buildNativeMcp({ watch: true }),
+    buildLiveTakeoverServer({ watch: true }),
+    buildLiveTakeoverMcp({ watch: true }),
   ]);
 
   await Promise.all(contexts.map((buildContext) => buildContext.watch()));

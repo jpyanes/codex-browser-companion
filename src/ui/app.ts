@@ -1,6 +1,7 @@
 import { DEFAULT_UI_POLL_MS } from "../shared/constants";
 import { bridgeStatusLabel, bridgeStatusTone, summarizeBridgeState } from "../shared/bridge";
 import { normalizeError, nowIso } from "../shared/logger";
+import { liveTakeoverStatusLabel, liveTakeoverStatusTone, summarizeLiveTakeoverState } from "../shared/live-takeover";
 import { semanticStatusLabel, semanticStatusTone, summarizeSemanticState } from "../shared/semantic";
 import { buildTabContextFromTrackedTab, formatTabContext } from "../shared/tab-context";
 import { sortTrackedTabs, summarizeTrackedTab, tabStatusLabel, tabStatusTone } from "../shared/tab-orchestration";
@@ -21,6 +22,7 @@ import type {
   ApprovalRequest,
   BridgeState,
   ExtensionState,
+  LiveTakeoverState,
   PageSnapshot,
   SuggestedAction,
   SuggestedRequest,
@@ -491,6 +493,55 @@ function renderBridgePanel(bridge: BridgeState | null): string {
   `;
 }
 
+function renderLiveTakeoverPanel(liveTakeover: LiveTakeoverState | null): string {
+  if (!liveTakeover) {
+    return `<section class="panel panel--takeover"><p class="empty">No live takeover state available yet.</p></section>`;
+  }
+
+  const tone = liveTakeoverStatusTone(liveTakeover.status);
+  const label = liveTakeoverStatusLabel(liveTakeover.status);
+  const toggleLabel = liveTakeover.enabled ? "Disable live takeover" : "Enable live takeover";
+
+  return `
+    <section class="panel panel--takeover">
+      <div class="section-head">
+        <h2>Live takeover</h2>
+        <span class="section-note">Visible-browser queue and command loop</span>
+      </div>
+      <div class="bridge-card takeover-card">
+        <div class="bridge-card__top">
+          <div>
+            <div class="bridge-card__label">Takeover state</div>
+            <div class="bridge-card__summary">${escapeHtml(summarizeLiveTakeoverState(liveTakeover))}</div>
+          </div>
+          <span class="status-chip status-chip--${tone}">${escapeHtml(label)}</span>
+        </div>
+        <div class="bridge-card__meta">
+          <span>Endpoint: ${escapeHtml(liveTakeover.endpoint)}</span>
+          <span>Enabled: ${liveTakeover.enabled ? "yes" : "no"}</span>
+          <span>Active tab: ${escapeHtml(liveTakeover.activeTitle || liveTakeover.activeUrl || (liveTakeover.activeTabId !== null ? `tab ${liveTakeover.activeTabId}` : "unknown"))}</span>
+          <span>Queue: ${liveTakeover.queueLength}</span>
+          <span>Last heartbeat: ${liveTakeover.lastHeartbeat ? escapeHtml(formatTime(liveTakeover.lastHeartbeat)) : "none"}</span>
+          <span>Checked: ${liveTakeover.checkedAt ? escapeHtml(formatTime(liveTakeover.checkedAt)) : "unknown"}</span>
+        </div>
+        ${
+          liveTakeover.lastError
+            ? `
+              <div class="bridge-card__error">
+                <div class="bridge-card__error-title">${escapeHtml(liveTakeover.lastError.message)}</div>
+                <div class="bridge-card__error-meta">${escapeHtml(liveTakeover.lastError.code)}</div>
+              </div>`
+            : ""
+        }
+        <div class="takeover-card__actions">
+          <button class="btn btn--ghost" data-action="refresh-live-takeover" type="button">Refresh takeover</button>
+          <button class="btn btn--primary" data-action="toggle-live-takeover" type="button">${escapeHtml(toggleLabel)}</button>
+        </div>
+      </div>
+    </section>
+  `;
+}
+
 function renderSemanticPanel(semantic: SemanticState | null): string {
   if (!semantic) {
     return `<section class="panel panel--semantic"><p class="empty">No semantic bridge state available yet.</p></section>`;
@@ -766,6 +817,7 @@ function renderPanels(
   tab: TrackedTabState | null,
   snapshot: PageSnapshot | null,
   bridge: BridgeState | null,
+  liveTakeover: LiveTakeoverState | null,
   semantic: SemanticState | null,
   workflow: WorkflowState | null,
   tabs: TrackedTabState[],
@@ -780,6 +832,7 @@ function renderPanels(
     ${renderSummary(tab, snapshot, mode)}
     ${renderTabOrchestrationPanel(tabs, activeTabId, mode, tabSearchQuery)}
     ${renderBridgePanel(bridge)}
+    ${renderLiveTakeoverPanel(liveTakeover)}
     ${renderSemanticPanel(semantic)}
     ${renderWorkflowPanel(workflow)}
     <section class="panel">
@@ -911,6 +964,8 @@ export class BrowserCompanionApp {
             <button class="btn btn--ghost" data-action="scan-page" data-mode="summary" type="button">Summarize</button>
             <button class="btn btn--ghost" data-action="scan-page" data-mode="suggestions" type="button">Suggest next</button>
             <button class="btn btn--ghost" data-action="refresh-bridge" type="button">Refresh bridge</button>
+            <button class="btn btn--ghost" data-action="refresh-live-takeover" type="button">Refresh takeover</button>
+            <button class="btn btn--ghost" data-action="toggle-live-takeover" type="button">Toggle takeover</button>
             <button class="btn btn--ghost" data-action="refresh-semantic" type="button">Refresh semantic</button>
             <button class="btn btn--ghost" data-action="refresh-tabs" type="button">Refresh tabs</button>
             <button class="btn btn--ghost" data-action="open-sidepanel" type="button">Open side panel</button>
@@ -1008,6 +1063,10 @@ export class BrowserCompanionApp {
           this.send({ kind: "scan-page", mode });
         } else if (action === "refresh-bridge") {
           this.send({ kind: "refresh-bridge" });
+        } else if (action === "refresh-live-takeover") {
+          this.send({ kind: "refresh-live-takeover" });
+        } else if (action === "toggle-live-takeover") {
+          this.send({ kind: "toggle-live-takeover" });
         } else if (action === "refresh-semantic") {
           this.send({ kind: "refresh-semantic" });
         } else if (action === "refresh-tabs") {
@@ -1202,6 +1261,7 @@ export class BrowserCompanionApp {
       activeTab,
       snapshot,
       this.state?.bridge ?? null,
+      this.state?.liveTakeover ?? null,
       this.state?.semantic ?? null,
       this.state?.workflow ?? null,
       Object.values(this.state?.tabs ?? {}),

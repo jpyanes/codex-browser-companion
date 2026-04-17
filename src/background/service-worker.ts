@@ -2,8 +2,10 @@ import {
   BRIDGE_POLL_INTERVAL_MS,
   CONTENT_SCRIPT_READY_RETRIES,
   CONTENT_SCRIPT_RETRY_DELAY_MS,
+  DEFAULT_LIVE_TAKEOVER_ENDPOINT,
   MAX_ACTIVITY_LOG_ENTRIES,
   MAX_APPROVAL_QUEUE_ENTRIES,
+  LIVE_TAKEOVER_POLL_INTERVAL_MS,
   SEMANTIC_POLL_INTERVAL_MS,
   STORAGE_KEY_STATE,
 } from "../shared/constants";
@@ -17,6 +19,12 @@ import {
   requiresManualIntervention,
 } from "../shared/action-policy";
 import { refreshBridgeState } from "./bridge-client";
+import {
+  fetchLiveTakeoverState,
+  getNextLiveTakeoverCommand,
+  postLiveTakeoverHeartbeat,
+  postLiveTakeoverResult,
+} from "../shared/live-takeover-client";
 import { createDisabledSemanticState, updateSemanticStateWithObservation } from "../shared/semantic";
 import { buildSemanticSuggestions } from "../shared/semantic";
 import {
@@ -37,18 +45,25 @@ import { resolveActionTabId, resolveSuggestedRequestTabId } from "../shared/tab-
 import { requestSemanticObservation, refreshSemanticState } from "./semantic-client";
 import { resolvePageStateFromSnapshot, resolveUserIntervention } from "../shared/dom";
 import { createActivityLogEntry, normalizeError, nowIso } from "../shared/logger";
-import { isContentEvent, isUiRequest, type ContentRequest, type ContentResponse, type UiEvent, type UiRequest } from "../shared/messages";
+import { isContentEvent, isUiRequest, type ContentRequest, type ContentResponse, type ContentTargetPayload, type UiEvent, type UiRequest } from "../shared/messages";
 import { readSessionValue, writeSessionValue } from "../shared/storage";
 import type {
   ActionRequest,
   AssistantConnectionState,
   ApprovalRequest,
   ExtensionState,
+  LiveTakeoverCommand,
   PageSnapshot,
   PageStateBasic,
   ScanMode,
   TrackedTabState,
 } from "../shared/types";
+import {
+  createDisconnectedLiveTakeoverState,
+  chooseLiveTakeoverTab,
+  summarizeLiveTakeoverState,
+  shouldAutoEnableLiveTakeover,
+} from "../shared/live-takeover";
 
 const uiPorts = new Set<chrome.runtime.Port>();
 
@@ -86,6 +101,7 @@ function createInitialState(): ExtensionState {
     tabs: {},
     bridge: createDisconnectedBridgeState(),
     semantic: createDisabledSemanticState(),
+    liveTakeover: createDisconnectedLiveTakeoverState(DEFAULT_LIVE_TAKEOVER_ENDPOINT, false),
     workflow: createInitialWorkflowState(),
     status: "idle",
     lastUpdatedAt: nowIso(),
@@ -124,6 +140,16 @@ function normalizeState(partial: Partial<ExtensionState> | undefined | null): Ex
     tabs,
     bridge: partial.bridge ?? createDisconnectedBridgeState(),
     semantic: partial.semantic ?? createDisabledSemanticState(),
+    liveTakeover: partial.liveTakeover
+      ? {
+          ...partial.liveTakeover,
+          hasBeenInitialized:
+            partial.liveTakeover.enabled ||
+            (typeof partial.liveTakeover.lastHeartbeat === "string" && partial.liveTakeover.lastHeartbeat.trim())
+              ? partial.liveTakeover.hasBeenInitialized ?? false
+              : false,
+        }
+      : createDisconnectedLiveTakeoverState(DEFAULT_LIVE_TAKEOVER_ENDPOINT, false),
     workflow: normalizeWorkflowState(partial.workflow ?? createInitialWorkflowState()),
     status: partial.status ?? "idle",
     lastUpdatedAt: typeof partial.lastUpdatedAt === "string" ? partial.lastUpdatedAt : nowIso(),
@@ -136,6 +162,8 @@ let bridgeRefreshTimer: ReturnType<typeof setInterval> | null = null;
 let bridgeRefreshInFlight = false;
 let semanticRefreshTimer: ReturnType<typeof setInterval> | null = null;
 let semanticRefreshInFlight = false;
+let liveTakeoverPollTimer: ReturnType<typeof setInterval> | null = null;
+let liveTakeoverPollInFlight = false;
 
 function getTabState(tabId: number): TrackedTabState {
   const existing = state.tabs[tabId];
@@ -343,6 +371,356 @@ function scheduleSemanticPolling(): void {
   }, SEMANTIC_POLL_INTERVAL_MS);
 }
 
+async function refreshLiveTakeoverStatus(): Promise<void> {
+  try {
+    const nextLiveTakeover = await fetchLiveTakeoverState(state.liveTakeover.endpoint, {
+      enabled: state.liveTakeover.enabled,
+      hasBeenInitialized: state.liveTakeover.hasBeenInitialized,
+    });
+    state.liveTakeover = {
+      ...nextLiveTakeover,
+      hasBeenInitialized: nextLiveTakeover.hasBeenInitialized || Boolean(nextLiveTakeover.lastHeartbeat),
+    };
+    commit();
+  } catch (error) {
+    state.liveTakeover = createDisconnectedLiveTakeoverState(
+      state.liveTakeover.endpoint,
+      state.liveTakeover.enabled,
+      normalizeError(error, "LIVE_TAKEOVER_UNAVAILABLE", { recoverable: true }),
+      nowIso(),
+      state.liveTakeover.hasBeenInitialized,
+    );
+    commit();
+  }
+}
+
+function scheduleLiveTakeoverPolling(): void {
+  if (!state.liveTakeover.enabled) {
+    if (liveTakeoverPollTimer !== null) {
+      clearInterval(liveTakeoverPollTimer);
+      liveTakeoverPollTimer = null;
+    }
+    return;
+  }
+
+  if (liveTakeoverPollTimer !== null) {
+    return;
+  }
+
+  liveTakeoverPollTimer = globalThis.setInterval(() => {
+    void refreshLiveTakeoverStatus();
+  }, LIVE_TAKEOVER_POLL_INTERVAL_MS);
+}
+
+function buildLiveTakeoverTargetPayload(payload: Record<string, unknown>): ContentTargetPayload {
+  const target: ContentTargetPayload = {};
+  if (typeof payload.selector === "string") {
+    target.selector = payload.selector;
+  }
+  if (typeof payload.bridgeId === "string") {
+    target.bridgeId = payload.bridgeId;
+  }
+  if (typeof payload.label === "string") {
+    target.label = payload.label;
+  }
+
+  return target;
+}
+
+function setLiveTakeoverEnabled(enabled: boolean): void {
+  const previousTabId = state.liveTakeover.activeTabId;
+  const previousWindowId = state.liveTakeover.activeWindowId;
+  state.liveTakeover = enabled
+    ? {
+        ...state.liveTakeover,
+        enabled: true,
+        status: state.liveTakeover.status === "error" ? "disconnected" : "connecting",
+        lastError: null,
+        hasBeenInitialized: state.liveTakeover.hasBeenInitialized,
+      }
+    : {
+        ...createDisconnectedLiveTakeoverState(state.liveTakeover.endpoint, false, null, nowIso(), state.liveTakeover.hasBeenInitialized),
+        lastHeartbeat: state.liveTakeover.lastHeartbeat,
+      };
+  commit();
+  scheduleLiveTakeoverPolling();
+  if (enabled) {
+    void syncLiveTakeoverMode(true);
+    void refreshLiveTakeoverStatus();
+  } else {
+    void syncLiveTakeoverMode(false, previousTabId, previousWindowId);
+  }
+}
+
+function toggleLiveTakeoverEnabled(): void {
+  setLiveTakeoverEnabled(!state.liveTakeover.enabled);
+}
+
+async function syncLiveTakeoverMode(enabled: boolean, tabIdOverride: number | null = null, windowIdOverride: number | null = null): Promise<void> {
+  if (!enabled) {
+    const currentTabId = tabIdOverride ?? state.liveTakeover.activeTabId;
+    if (currentTabId !== null) {
+      try {
+        await sendContentRequest(currentTabId, {
+          kind: "set-live-takeover",
+          enabled: false,
+          endpoint: state.liveTakeover.endpoint,
+          tabId: currentTabId,
+          windowId: windowIdOverride ?? state.liveTakeover.activeWindowId,
+        });
+      } catch {
+        // Best-effort stop.
+      }
+    }
+    return;
+  }
+
+  const targetTab = await resolveLiveTakeoverTargetTab();
+  if (!targetTab || !isInspectableUrl(targetTab.url)) {
+      state.liveTakeover = createDisconnectedLiveTakeoverState(
+        state.liveTakeover.endpoint,
+        true,
+        normalizeError("No visible content tab is available for live takeover.", "LIVE_TAKEOVER_UNAVAILABLE", { recoverable: true }),
+        nowIso(),
+        true,
+      );
+      commit({ kind: "error", error: state.liveTakeover.lastError ?? normalizeError("No visible content tab is available for live takeover.", "LIVE_TAKEOVER_UNAVAILABLE", { recoverable: true }) });
+      return;
+  }
+
+  const previousTabId = state.liveTakeover.activeTabId;
+  if (previousTabId !== null && previousTabId !== targetTab.tabId) {
+    try {
+      await sendContentRequest(previousTabId, {
+        kind: "set-live-takeover",
+        enabled: false,
+        endpoint: state.liveTakeover.endpoint,
+        tabId: previousTabId,
+        windowId: state.liveTakeover.activeWindowId,
+      });
+    } catch {
+      // Ignore stale attachment cleanup.
+    }
+  }
+
+  try {
+    const response = await sendContentRequest(targetTab.tabId, {
+      kind: "set-live-takeover",
+      enabled: true,
+      endpoint: state.liveTakeover.endpoint,
+      tabId: targetTab.tabId,
+      windowId: targetTab.windowId ?? null,
+    });
+
+    if (response.kind !== "live-takeover-state") {
+      throw new Error(`Unexpected live takeover response: ${response.kind}`);
+    }
+
+    state.liveTakeover = {
+      ...state.liveTakeover,
+      enabled: true,
+      status: "connecting",
+      activeTabId: targetTab.tabId,
+      activeWindowId: targetTab.windowId ?? null,
+      activeUrl: targetTab.url,
+      activeTitle: targetTab.title,
+      checkedAt: nowIso(),
+      lastHeartbeat: response.lastHeartbeat,
+      lastError: null,
+    };
+    commit();
+  } catch (error) {
+    state.liveTakeover = createDisconnectedLiveTakeoverState(
+      state.liveTakeover.endpoint,
+      true,
+      normalizeError(error, "LIVE_TAKEOVER_UNAVAILABLE", { recoverable: true }),
+      nowIso(),
+      true,
+    );
+    commit({ kind: "error", error: state.liveTakeover.lastError ?? normalizeError(error, "LIVE_TAKEOVER_UNAVAILABLE", { recoverable: true }) });
+  }
+}
+
+async function executeLiveTakeoverCommand(tabId: number, command: LiveTakeoverCommand): Promise<void> {
+  const tabState = getTabState(tabId);
+  const liveEndpoint = state.liveTakeover.endpoint;
+  const startedAt = nowIso();
+
+  if (isAwaitingUserIntervention(tabState)) {
+    const intervention = getManualIntervention(tabState);
+    pushLog(tabId, "warning", "Live takeover paused for a manual browser step.", intervention?.message ?? "Complete the step manually, then type done to continue.");
+    commit();
+    return;
+  }
+
+  markBusy(tabId, true);
+  commit();
+
+  try {
+    let result: unknown = null;
+    switch (command.type) {
+      case "snapshot": {
+        const mode = command.payload?.mode === "interactive" || command.payload?.mode === "summary" || command.payload?.mode === "suggestions" ? command.payload.mode : "full";
+        const snapshot = await recordSnapshot(tabId, mode);
+        result = {
+          snapshotId: snapshot.snapshotId,
+          summary: snapshot.summary,
+          pageKind: snapshot.pageKind,
+          capturedAt: snapshot.capturedAt,
+        };
+        break;
+      }
+      case "navigate": {
+        const url = typeof command.payload?.url === "string" && command.payload.url.trim() ? command.payload.url : "about:blank";
+        await chrome.tabs.update(tabId, { url });
+        result = { navigatedTo: url };
+        break;
+      }
+      case "click":
+      case "fill":
+      case "press": {
+        const payload = command.payload as ContentTargetPayload & Record<string, unknown>;
+        const response = await sendContentRequest(
+          tabId,
+          command.type === "click"
+            ? {
+                kind: "click",
+                tabId,
+                payload: buildLiveTakeoverTargetPayload(payload),
+              }
+            : command.type === "fill"
+              ? {
+                  kind: "fill",
+                  tabId,
+                  payload: {
+                    ...buildLiveTakeoverTargetPayload(payload),
+                    value: typeof payload.value === "string" ? payload.value : "",
+                    ...(typeof payload.clearBeforeTyping === "boolean" ? { clearBeforeTyping: payload.clearBeforeTyping } : {}),
+                  },
+                }
+              : {
+                  kind: "press",
+                  tabId,
+                  payload: {
+                    ...buildLiveTakeoverTargetPayload(payload),
+                    ...(typeof payload.key === "string" ? { key: payload.key } : {}),
+                    ...(typeof payload.submitForm === "boolean" ? { submitForm: payload.submitForm } : {}),
+                  },
+                },
+        );
+
+        if (response.kind === "content-error") {
+          throw new Error(response.error.message);
+        }
+
+        if (response.kind !== "action-result") {
+          throw new Error(`Unexpected content response: ${response.kind}`);
+        }
+
+        result = response.result;
+        break;
+      }
+    }
+
+    const executionResult = {
+      commandId: command.id,
+      ok: true,
+      result,
+      ts: startedAt,
+    };
+    await postLiveTakeoverResult(liveEndpoint, executionResult);
+    pushLog(tabId, "success", `Executed live takeover ${command.type}.`, typeof result === "string" ? result : JSON.stringify(result, null, 2));
+    commit();
+  } catch (error) {
+    const normalized = normalizeError(error, "LIVE_TAKEOVER_COMMAND_FAILED", { tabId, recoverable: true });
+    await postLiveTakeoverResult(liveEndpoint, {
+      commandId: command.id,
+      ok: false,
+      result: {
+        error: normalized.message,
+        details: normalized.details ?? null,
+      },
+      ts: nowIso(),
+    });
+    setLastError(tabId, normalized);
+    pushLog(tabId, "error", `Live takeover ${command.type} failed.`, normalized.message);
+    commit({ kind: "error", error: normalized });
+  } finally {
+    markBusy(tabId, false);
+    commit();
+  }
+}
+
+async function resolveLiveTakeoverTargetTab(): Promise<TrackedTabState | null> {
+  const preferredTabId = state.liveTakeover.activeTabId;
+  const preferred = chooseLiveTakeoverTab(Object.values(state.tabs), preferredTabId);
+  if (preferred) {
+    return preferred;
+  }
+
+  await refreshKnownTabs();
+  return chooseLiveTakeoverTab(Object.values(state.tabs), preferredTabId);
+}
+
+async function pollLiveTakeover(): Promise<void> {
+  if (liveTakeoverPollInFlight || !state.liveTakeover.enabled) {
+    return;
+  }
+
+  liveTakeoverPollInFlight = true;
+  try {
+    const targetTab = await resolveLiveTakeoverTargetTab();
+    if (!targetTab || !isInspectableUrl(targetTab.url)) {
+      await refreshLiveTakeoverStatus();
+      return;
+    }
+
+    if (state.activeTabId !== targetTab.tabId) {
+      await focusTrackedTab(targetTab.tabId);
+    }
+
+    const heartbeatTs = nowIso();
+    const synced = await syncActiveTab(targetTab.tabId);
+    const tabState = synced ?? getTabState(targetTab.tabId);
+    if (!isInspectableUrl(tabState.url)) {
+      await refreshLiveTakeoverStatus();
+      return;
+    }
+
+    await postLiveTakeoverHeartbeat(state.liveTakeover.endpoint, {
+      tabId: tabState.tabId,
+      windowId: tabState.windowId ?? null,
+      url: tabState.url ?? null,
+      title: tabState.title ?? null,
+      ts: heartbeatTs,
+    });
+
+    if (isAwaitingUserIntervention(tabState)) {
+      await refreshLiveTakeoverStatus();
+      return;
+    }
+
+    const command = await getNextLiveTakeoverCommand(state.liveTakeover.endpoint, tabState.tabId, tabState.url ?? null);
+    if (command) {
+      await executeLiveTakeoverCommand(tabState.tabId, command);
+    }
+
+    await refreshLiveTakeoverStatus();
+  } catch (error) {
+    state.liveTakeover = createDisconnectedLiveTakeoverState(
+      state.liveTakeover.endpoint,
+      true,
+      normalizeError(error, "LIVE_TAKEOVER_UNAVAILABLE", { recoverable: true }),
+      nowIso(),
+      true,
+    );
+    pushLog(state.activeTabId ?? null, "error", "Live takeover polling failed.", summarizeLiveTakeoverState(state.liveTakeover));
+    commit({ kind: "error", error: state.liveTakeover.lastError ?? normalizeError(error, "LIVE_TAKEOVER_UNAVAILABLE", { recoverable: true }) });
+  } finally {
+    liveTakeoverPollInFlight = false;
+  }
+}
+
 async function resolveSemanticTarget(tabId: number, selector: string): Promise<{ elementId: string; label: string } | null> {
   try {
     const response = await sendContentRequest(tabId, { kind: "resolve-selector", selector });
@@ -431,7 +809,11 @@ function setLastError(tabId: number, error: ReturnType<typeof normalizeError> | 
   }));
 }
 
-function pushLog(tabId: number, level: "debug" | "info" | "success" | "warning" | "error", message: string, details?: string): void {
+function pushLog(tabId: number | null, level: "debug" | "info" | "success" | "warning" | "error", message: string, details?: string): void {
+  if (tabId === null) {
+    return;
+  }
+
   const entry = createActivityLogEntry(level, message, { tabId, details });
   replaceTabState(tabId, (current) => ({
     ...current,
@@ -1125,6 +1507,12 @@ async function handleUiRequest(port: chrome.runtime.Port, request: UiRequest): P
     case "refresh-semantic":
       await refreshSemanticStatus();
       return;
+    case "refresh-live-takeover":
+      await refreshLiveTakeoverStatus();
+      return;
+    case "toggle-live-takeover":
+      toggleLiveTakeoverEnabled();
+      return;
     case "resume-user-intervention":
       await resumeManualIntervention();
       return;
@@ -1173,6 +1561,9 @@ async function handleContentEvent(message: unknown, sender: chrome.runtime.Messa
       }));
       logManualInterventionTransition(tabId, previousInterventionKind, nextState);
       state.workflow = recordWorkflowPageState(state.workflow, tabId, nextState, null);
+      if (state.liveTakeover.enabled && state.liveTakeover.activeTabId === tabId) {
+        void syncLiveTakeoverMode(true);
+      }
       commit();
       return;
     }
@@ -1196,6 +1587,14 @@ async function boot(): Promise<void> {
 }
 
 await boot();
+if (shouldAutoEnableLiveTakeover(state.liveTakeover)) {
+  setLiveTakeoverEnabled(true);
+} else {
+  scheduleLiveTakeoverPolling();
+  if (state.liveTakeover.enabled) {
+    void refreshLiveTakeoverStatus();
+  }
+}
 
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== "codex-ui") {
@@ -1206,8 +1605,10 @@ chrome.runtime.onConnect.addListener((port) => {
   port.postMessage({ kind: "state", state } satisfies UiEvent);
   void refreshBridgeStatus();
   void refreshSemanticStatus();
+  void refreshLiveTakeoverStatus();
   scheduleBridgePolling();
   scheduleSemanticPolling();
+  scheduleLiveTakeoverPolling();
   port.onMessage.addListener((message: unknown) => {
     if (!isUiRequest(message)) {
       return;
@@ -1231,7 +1632,28 @@ chrome.runtime.onConnect.addListener((port) => {
   });
 });
 
-chrome.runtime.onMessage.addListener((message: unknown, sender) => {
+chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
+  if (typeof message === "object" && message !== null && (message as { kind?: unknown }).kind === "get-live-takeover-context") {
+    const tabId = resolveTabIdFromSender(sender);
+    const tabState = tabId !== null ? getTabState(tabId) : null;
+    const visibleUrl = tabState?.url ?? sender.tab?.url ?? null;
+    const autoEnable = shouldAutoEnableLiveTakeover(state.liveTakeover);
+    if (autoEnable) {
+      setLiveTakeoverEnabled(true);
+    }
+
+    sendResponse({
+      kind: "live-takeover-context",
+      enabled: state.liveTakeover.enabled || autoEnable,
+      shouldStart: Boolean((state.liveTakeover.enabled || autoEnable) && tabId !== null && isInspectableUrl(visibleUrl ?? undefined)),
+      endpoint: state.liveTakeover.endpoint,
+      tabId,
+      windowId: sender.tab?.windowId ?? tabState?.windowId ?? null,
+      lastHeartbeat: state.liveTakeover.lastHeartbeat,
+    });
+    return;
+  }
+
   if (!isContentEvent(message)) {
     return;
   }
@@ -1314,11 +1736,17 @@ chrome.runtime.onInstalled.addListener(() => {
   void refreshKnownTabs();
   void refreshBridgeStatus();
   void refreshSemanticStatus();
+  void refreshLiveTakeoverStatus();
+  scheduleLiveTakeoverPolling();
   updateBadge();
 });
 
 chrome.runtime.onStartup.addListener(() => {
   void refreshKnownTabs();
+  scheduleLiveTakeoverPolling();
+  if (state.liveTakeover.enabled) {
+    void refreshLiveTakeoverStatus();
+  }
 });
 
 chrome.action.setBadgeText({ text: "" }).catch(() => undefined);

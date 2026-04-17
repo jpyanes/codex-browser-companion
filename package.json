@@ -9,6 +9,8 @@
     "build": "node scripts/build.mjs",
     "bridge": "playwriter serve --host localhost",
     "dev": "node scripts/watch.mjs",
+    "live-takeover": "node dist/live-takeover/server.js",
+    "live-takeover-mcp": "node dist/native/live-takeover-mcp.js",
     "native-mcp": "node dist/native/tab-mcp.js",
     "semantic": "node scripts/semantic-bridge.mjs",
     "test": "vitest run",

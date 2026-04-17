@@ -23,6 +23,8 @@ type MessageKind =
   | "refresh-tabs"
   | "focus-tab"
   | "scan-tab"
+  | "refresh-live-takeover"
+  | "toggle-live-takeover"
   | "approve-action"
   | "reject-action"
   | "refresh-bridge"
@@ -31,7 +33,14 @@ type MessageKind =
   | "open-sidepanel"
   | "clear-log"
   | "ping"
+  | "get-live-takeover-context"
+  | "set-live-takeover"
+  | "live-takeover-state"
+  | "live-takeover-context"
   | "capture-page"
+  | "click"
+  | "fill"
+  | "press"
   | "resolve-selector"
   | "perform-action"
   | "page-state"
@@ -128,6 +137,14 @@ export interface UiRefreshSemanticRequest extends MessageEnvelopeBase {
   kind: "refresh-semantic";
 }
 
+export interface UiRefreshLiveTakeoverRequest extends MessageEnvelopeBase {
+  kind: "refresh-live-takeover";
+}
+
+export interface UiToggleLiveTakeoverRequest extends MessageEnvelopeBase {
+  kind: "toggle-live-takeover";
+}
+
 export interface UiResumeUserInterventionRequest extends MessageEnvelopeBase {
   kind: "resume-user-intervention";
 }
@@ -155,6 +172,8 @@ export type UiRequest =
   | UiRejectActionRequest
   | UiRefreshBridgeRequest
   | UiRefreshSemanticRequest
+  | UiRefreshLiveTakeoverRequest
+  | UiToggleLiveTakeoverRequest
   | UiResumeUserInterventionRequest
   | UiOpenSidePanelRequest
   | UiClearLogRequest;
@@ -202,9 +221,51 @@ export interface ContentPingRequest extends MessageEnvelopeBase {
   kind: "ping";
 }
 
+export interface ContentLiveTakeoverContextRequest extends MessageEnvelopeBase {
+  kind: "get-live-takeover-context";
+}
+
+export interface ContentSetLiveTakeoverRequest extends MessageEnvelopeBase {
+  kind: "set-live-takeover";
+  enabled: boolean;
+  endpoint: string;
+  tabId: number;
+  windowId: number | null;
+}
+
 export interface ContentCapturePageRequest extends MessageEnvelopeBase {
   kind: "capture-page";
   mode: ScanMode;
+}
+
+export interface ContentTargetPayload {
+  selector?: string;
+  bridgeId?: string;
+  label?: string;
+}
+
+export interface ContentClickRequest extends MessageEnvelopeBase {
+  kind: "click";
+  tabId: number;
+  payload: ContentTargetPayload;
+}
+
+export interface ContentFillRequest extends MessageEnvelopeBase {
+  kind: "fill";
+  tabId: number;
+  payload: ContentTargetPayload & {
+    value: string;
+    clearBeforeTyping?: boolean;
+  };
+}
+
+export interface ContentPressRequest extends MessageEnvelopeBase {
+  kind: "press";
+  tabId: number;
+  payload: ContentTargetPayload & {
+    key?: string;
+    submitForm?: boolean;
+  };
 }
 
 export interface ContentResolveSelectorRequest extends MessageEnvelopeBase {
@@ -219,7 +280,12 @@ export interface ContentPerformActionRequest extends MessageEnvelopeBase {
 
 export type ContentRequest =
   | ContentPingRequest
+  | ContentLiveTakeoverContextRequest
+  | ContentSetLiveTakeoverRequest
   | ContentCapturePageRequest
+  | ContentClickRequest
+  | ContentFillRequest
+  | ContentPressRequest
   | ContentResolveSelectorRequest
   | ContentPerformActionRequest;
 
@@ -257,7 +323,28 @@ export interface ContentPongEvent extends MessageEnvelopeBase {
   state: PageStateBasic;
 }
 
+export interface ContentLiveTakeoverContextResponse extends MessageEnvelopeBase {
+  kind: "live-takeover-context";
+  enabled: boolean;
+  shouldStart: boolean;
+  endpoint: string;
+  tabId: number | null;
+  windowId: number | null;
+  lastHeartbeat: string | null;
+}
+
+export interface ContentLiveTakeoverStateEvent extends MessageEnvelopeBase {
+  kind: "live-takeover-state";
+  enabled: boolean;
+  endpoint: string;
+  tabId: number;
+  windowId: number | null;
+  lastHeartbeat: string | null;
+}
+
 export type ContentResponse =
+  | ContentLiveTakeoverContextResponse
+  | ContentLiveTakeoverStateEvent
   | ContentResponseEvent
   | ContentResolveSelectorResponse
   | ContentActionResultEvent
@@ -266,6 +353,7 @@ export type ContentResponse =
 
 export type ContentEvent =
   | ContentPageStateEvent
+  | ContentLiveTakeoverStateEvent
   | ContentResponseEvent
   | ContentResolveSelectorResponse
   | ContentActionResultEvent

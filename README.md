@@ -11,6 +11,7 @@ It is designed to:
 - support step-by-step page workflows
 - remember and resume multi-step workflows locally
 - search and focus tracked tabs through an MCP-style tab intelligence layer
+- offer a dedicated live takeover mode that mirrors the old visible-browser bridge pattern
 - keep the browser-side control surface small, explicit, and auditable
 
 ## Architecture
@@ -22,10 +23,14 @@ flowchart LR
   CS --> BG
   BG --> BR[Playwriter relay on localhost]
   BR --> CH[Existing Chrome session]
+  BG --> LT[Live takeover queue on localhost]
+  LT --> CH
   BG --> SB[Stagehand semantic bridge on localhost]
   SB --> BR
   BG --> NM[Native MCP facade on stdio]
   NM --> BR
+  BG --> LM[Live takeover MCP facade on stdio]
+  LM --> LT
   BG --> SA[Site adapters and tab intelligence]
   BG --> UI
   BG --> ST[(chrome.storage.session)]
@@ -36,8 +41,10 @@ flowchart LR
 - `background/service-worker.ts` orchestrates state, approvals, tab tracking, badge updates, and message routing.
 - `content/content-script.ts` inspects the DOM, captures page snapshots, observes navigation/mutations, and executes approved page actions.
 - `Playwriter` provides the live Chrome bridge on `localhost:19988`; CBC polls it for bridge health and session attachment.
+- `live-takeover/server.ts` provides a dedicated queue-based visible-browser bridge on `localhost:47123`; CBC uses it for the direct live takeover mode.
 - `Stagehand` provides the optional semantic bridge on `localhost:19989`; CBC uses it to derive higher-quality next-action suggestions when the bridge is enabled.
 - `native/tab-mcp.ts` provides an optional local MCP facade that speaks the same `TabContext` contract to external Codex clients.
+- `native/live-takeover-mcp.ts` provides an MCP facade over the live takeover queue so external Codex clients can use the same visible-browser bridge contract.
 - `shared/site-adapters.ts` recognizes common site-specific experiences and produces adapter-aware guidance for Google sign-in, Google Drive, Google Docs, and LinkedIn.
 - `shared/tab-intelligence.ts` powers the MCP-style cross-tab search and ranking layer used by the tab inventory panel.
 - `ui/popup/*` provides the quick interaction surface.
@@ -126,7 +133,13 @@ npm install
 npm run bridge
 ```
 
-3. If you want semantic suggestions, optionally start the Stagehand bridge in a third terminal after setting `STAGEHAND_MODEL` and the matching provider API key:
+3. Start the dedicated live takeover bridge in another terminal:
+
+```bash
+npm run live-takeover
+```
+
+4. If you want semantic suggestions, optionally start the Stagehand bridge in a fourth terminal after setting `STAGEHAND_MODEL` and the matching provider API key:
 
 ```bash
 npm run semantic
@@ -134,7 +147,7 @@ npm run semantic
 
 For example, `STAGEHAND_MODEL=openai/gpt-4.1-mini` with `OPENAI_API_KEY` set will enable Stagehand suggestions through the local bridge.
 
-4. Build the extension:
+5. Build the extension:
 
 ```bash
 npm run build
@@ -146,11 +159,17 @@ If you want the native tab-context MCP facade for an external Codex client, star
 npm run native-mcp
 ```
 
-5. Open Chrome and go to `chrome://extensions`.
+If you want the live takeover MCP facade for an external Codex client, start it in another terminal after building:
 
-6. Turn on Developer mode.
+```bash
+npm run live-takeover-mcp
+```
 
-7. Click Load unpacked and select the `dist/` folder from this workspace.
+6. Open Chrome and go to `chrome://extensions`.
+
+7. Turn on Developer mode.
+
+8. Click Load unpacked and select the `dist/` folder from this workspace.
 
 The bridge uses your existing Chrome session rather than launching a fresh automation browser. In the Playwriter extension, click the icon on the tab you want to expose until it turns green.
 
@@ -172,6 +191,12 @@ If you are working on live-session attachment, keep the Playwriter bridge runnin
 npm run bridge
 ```
 
+If you are working on the dedicated visible-browser takeover lane, keep the live takeover bridge running in another terminal:
+
+```bash
+npm run live-takeover
+```
+
 If you are working on semantic suggestions, keep the Stagehand bridge running in another terminal after configuring `STAGEHAND_MODEL`:
 
 ```bash
@@ -184,6 +209,7 @@ Helpful extra commands:
 npm run typecheck
 npm test
 npm run native-mcp
+npm run live-takeover-mcp
 ```
 
 ## Build Output
@@ -202,6 +228,8 @@ Important output files:
 - `dist/sidepanel/panel.js`
 - `dist/sidepanel/panel.css`
 - `dist/native/tab-mcp.js`
+- `dist/native/live-takeover-mcp.js`
+- `dist/live-takeover/server.js`
 - `dist/icons/icon-16.png`
 - `dist/icons/icon-32.png`
 - `dist/icons/icon-48.png`
@@ -216,7 +244,7 @@ The extension requests only the permissions it needs:
 - `storage` saves session state, approvals, and logs locally inside the extension.
 - `tabs` reads the active tab URL/title and tracks navigation or activation changes.
 - `sidePanel` enables the persistent side panel UI on supported Chrome versions.
-- `host_permissions` for `http://localhost:19988/*`, `http://127.0.0.1:19988/*`, `http://localhost:19989/*`, and `http://127.0.0.1:19989/*` let the extension check the local Playwriter and Stagehand bridge health without giving it broad network access.
+- `host_permissions` for `http://localhost:19988/*`, `http://127.0.0.1:19988/*`, `http://localhost:19989/*`, `http://127.0.0.1:19989/*`, `http://localhost:47123/*`, and `http://127.0.0.1:47123/*` let the extension check the local Playwriter, Stagehand, and live takeover bridge health without giving it broad network access.
 
 There are no blanket host permissions. The extension stays focused on the active tab rather than silently broadening access across every site.
 
@@ -231,6 +259,7 @@ This extension is intentionally conservative.
 - It requires explicit approval for click, type, select, and submit actions.
 - It does not send page data to a remote service.
 - It only talks to the local Playwriter relay on `localhost`, which is used to attach to the already-open Chrome session.
+- Its dedicated live takeover bridge is also local-only and uses the visible content tab in the Chrome session as the source of truth.
 - Its Stagehand semantic bridge is optional and read-only. It only analyzes the current page and produces suggestions; it does not execute browser actions directly.
 - It does not auto-run arbitrary browser actions without a visible approval gate.
 - It marks snapshots stale when the page changes so the user can rescan before approving actions.
@@ -247,6 +276,9 @@ If a page is not inspectable, the extension refuses to inject or act and surface
 - The local Playwriter relay bridge is separate from the Codex UI and must be started explicitly with `npm run bridge`.
 - The Playwriter relay bridge must be running for live-session attachment; otherwise the bridge panel will show it as disconnected.
 - You still need the Playwriter browser extension enabled on at least one tab to expose the existing Chrome session.
+- The dedicated live takeover bridge is separate from the Codex UI and must be started explicitly with `npm run live-takeover`.
+- On a fresh browser session, CBC auto-attaches live takeover once so the visible Chrome tab can heartbeat without a manual toggle; if you disable it in the UI, that choice is respected on later reloads.
+- The live takeover bridge only controls an inspectable content tab in the visible Chrome session; if the browser is only showing the extension UI or another unsupported page, the queue will stay disconnected until a real tab is available.
 - The Stagehand semantic bridge is optional. Without `STAGEHAND_MODEL` and a matching provider API key it stays disabled and CBC falls back to DOM-based suggestions.
 - The Stagehand bridge must be started explicitly with `npm run semantic`.
 
@@ -287,25 +319,30 @@ Use these page types after loading the unpacked extension:
    - Run `Summarize page`.
    - Confirm the visible text is capped and the outline is readable.
 
-7. Live bridge
+7. Live takeover
+   - Run `npm run live-takeover` in a terminal.
+   - Confirm the live takeover panel changes to connected once the visible Chrome session heartbeats.
+   - Queue a small command and confirm the visible browser updates in real time.
+
+8. Live bridge
    - Run `npm run bridge` in a terminal.
    - Enable the Playwriter extension on a tab in your existing Chrome session.
    - Confirm the bridge panel changes to connected.
    - Refresh the current tab and confirm the active tab context still updates normally.
 
-8. Semantic bridge
+9. Semantic bridge
    - Set `STAGEHAND_MODEL` and the matching provider API key if you want semantic suggestions.
    - Run `npm run semantic` in a terminal.
    - Open a page with visible buttons or links.
    - Run `Suggest next` and confirm the Stagehand-backed suggestions appear alongside the DOM suggestions.
 
-9. Workflow memory
+10. Workflow memory
    - Open a page with at least one visible button or control.
    - Enter a multi-step command such as `click save changes and then summarize page`.
    - Confirm the workflow panel appears with the plan steps and current step highlight.
    - Complete the first step and verify the next step becomes available from workflow memory.
 
-10. Multi-tab orchestration
+11. Multi-tab orchestration
    - Open a few web pages in different tabs.
    - Click `Refresh tabs` and confirm the tab inventory fills in.
    - Use `Focus` on a non-active tab and confirm the browser moves there.
@@ -314,6 +351,7 @@ Use these page types after loading the unpacked extension:
 ## Future Enhancements
 
 - richer Codex runtime bridge and planner integration
+- a tighter visible-browser takeover loop with richer command batching and replay
 - richer Stagehand-backed page understanding and semantic grouping
 - site-specific adapters
 - safer action sandboxing
